@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RR Mug Tracker
 // @namespace    fatboy.torn
-// @version      0.1.7
+// @version      0.1.8
 // @description  Russian Roulette lobby tracker for Torn PDA (iOS): observe active games, log events, show elapsed time.
 // @author       FATBOY [572123]
 // @match        https://www.torn.com/page.php*
@@ -10,6 +10,35 @@
 // ==/UserScript==
 
 /*
+ * RR Mug Tracker v0.1.8 — make inline lobby countdown visible on Torn PDA iOS.
+ * No API calls, no auto-play, no attacks, no mugging.
+ *
+ * v0.1.8 changes:
+ *   - injectLobbyTimers() now overrides the statusBlock cell's CSS before
+ *     appending the timer span:
+ *       statusCell.style.position = 'relative'  — makes cell a positioning ctx
+ *       statusCell.style.overflow = 'visible'   — overrides Torn's clip rule
+ *     The span itself is position:absolute anchored to the cell bottom, so it
+ *     never pushes "Waiting..." out of view and is not clipped by fixed row height.
+ *     Root cause: display:block pushed the timer below the text, and the cell's
+ *     overflow:hidden clipped the second line.  Confirmed via live DOM text:
+ *     "Seaso1 Waiting...14:22$10,000,000" — span present but invisible.
+ *   - injectLobbyTimers(now) accepts an optional timestamp so tests can inject a
+ *     fixed time without race conditions.
+ *   - scanLobby() captures Date.now() once and passes it to both processGames()
+ *     and injectLobbyTimers() for consistency.
+ *   - tickTimers() passes its captured now to injectLobbyTimers(now).
+ *   - MutationObserver callback also skips mutations whose addedNodes include a
+ *     [data-rrmt-timer] span (prevents the span-append itself from triggering a
+ *     spurious re-scan).
+ *   - removeInlineTimers() restores statusCell.style.overflow and .position to ''
+ *     on cleanup.
+ *   - captureDomDiag() gains a timerDiag section: bounding rects, computed
+ *     display/visibility/overflow/position for every injected span and its parent.
+ *   - Suite N added: 6 regression tests for visibility-fix changes (N1-N6).
+ *   - Tests J8 and M5 corrected (J8 fixture lacked statusBlock; M5 timestamp
+ *     mismatch fixed by passing explicit now to injectLobbyTimers).
+ *
  * RR Mug Tracker v0.1.7 — fix inline timer position and bet parsing corruption.
  * No API calls, no auto-play, no attacks, no mugging.
  *
@@ -125,7 +154,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '0.1.7';
+  const VERSION = '0.1.8';
   if (window.top !== window.self) return;
 
   /* isRRPage accepts optional (pn, qs) args for test-harness use */
@@ -671,11 +700,40 @@
       } catch (e) {}
     }
 
+    /* 11 — injected timer span visibility (bounding rects + computed styles) */
+    const timerDiag = [];
+    try {
+      document.querySelectorAll('[data-rrmt-timer]').forEach(function (span) {
+        const r   = span.getBoundingClientRect();
+        const cs  = window.getComputedStyle(span);
+        const par = span.parentElement;
+        const pcs = par ? window.getComputedStyle(par) : null;
+        timerDiag.push({
+          gId:     span.getAttribute('data-rrmt-timer'),
+          text:    span.textContent.slice(0, 20),
+          visible: r.width > 0 && r.height > 0 &&
+                   cs.visibility !== 'hidden' && cs.display !== 'none',
+          rect:    { t: Math.round(r.top), l: Math.round(r.left),
+                     w: Math.round(r.width), h: Math.round(r.height) },
+          cs:      { display: cs.display, visibility: cs.visibility,
+                     overflow: cs.overflow, opacity: cs.opacity,
+                     position: cs.position, bottom: cs.bottom },
+          par: par ? {
+            cls:      safeClass(par).slice(0, 60),
+            overflow: pcs ? pcs.overflow : null,
+            position: pcs ? pcs.position : null,
+            height:   pcs ? pcs.height : null,
+          } : null,
+        });
+      });
+    } catch (e) { /* defensive */ }
+
     const diag = {
       v: VERSION, ts, loc,
       bodyLinks: { profile: bodyProfile, withGame: bodyGame },
       heads, cands, sec: secInfo, rows, tree,
       headingPath, profileLinks: profileLinkSample, rowDataAttrs,
+      timerDiag,
     };
 
     let out = JSON.stringify(diag, null, 2);
@@ -766,8 +824,9 @@
     State.parseOk = result.ok;
     State.parseNote = result.reason;
     if (!result.ok) { UI.render(); return; }
-    processGames(result.games, isInitial, Date.now());
-    injectLobbyTimers();
+    const now = Date.now();
+    processGames(result.games, isInitial, now);
+    injectLobbyTimers(now);
     UI.render();
   }
 
@@ -806,6 +865,15 @@
         if (tgt && tgt.hasAttribute && tgt.hasAttribute('data-rrmt-timer')) continue;
         if (tgt && tgt.parentElement && tgt.parentElement.hasAttribute &&
             tgt.parentElement.hasAttribute('data-rrmt-timer')) continue;
+        /* Skip if the mutation is our own timer-span insertion */
+        const added = mutations[i].addedNodes;
+        let ourSpan = false;
+        for (let j = 0; j < added.length; j++) {
+          if (added[j].hasAttribute && added[j].hasAttribute('data-rrmt-timer')) {
+            ourSpan = true; break;
+          }
+        }
+        if (ourSpan) continue;
         scheduleScan();
         return;
       }
@@ -829,18 +897,20 @@
 
   /* injectLobbyTimers — inject countdown inside each game row's status cell.
      Targets [class*="statusBlock"] so the timer stays inside the correct column.
-     Rows that have no statusBlock are skipped — the tracker never appends outside
-     the row's column structure.  Idempotent: if a statusBlock already contains
-     our span (row.querySelector finds it), the row is skipped.  React rerenders
-     that clear the statusBlock innerHTML will be re-injected on the next tick. */
-  function injectLobbyTimers() {
+     Rows that have no statusBlock are skipped.  Idempotent: row.querySelector
+     finds existing span and skips the row.  React rerenders that clear
+     statusBlock innerHTML cause the span to disappear; re-injected next tick.
+     Visibility fix (v0.1.8): statusCell gets position:relative/overflow:visible
+     so the absolutely-positioned span is not clipped by the cell's fixed height.
+     Accepts an optional `now` timestamp for deterministic testing. */
+  function injectLobbyTimers(now) {
+    var t = (now !== undefined) ? now : Date.now();
     try {
       const section = findGamesSection();
       if (!section) return;
       const rowsWrap = findRowsWrap(section);
       if (!rowsWrap) return;
       const ownHost = document.getElementById(NS + '-host');
-      const now = Date.now();
       Array.from(rowsWrap.children).forEach(function (row) {
         if (!row.id || !/^\d+$/.test(row.id)) return;
         if (ownHost && ownHost.contains(row)) return;
@@ -850,13 +920,33 @@
         let statusCell = null;
         try { statusCell = row.querySelector('[class*="statusBlock"]'); } catch (e) { /* skip */ }
         if (!statusCell) return;
+        /* Override CSS that would clip the absolutely-positioned child */
+        statusCell.style.position = 'relative';
+        statusCell.style.overflow = 'visible';
         const gId = row.id;
         let entry = null;
         State.games.forEach(function (e) { if (e.gameId === gId) entry = e; });
         const span = document.createElement('span');
         span.setAttribute('data-rrmt-timer', gId);
-        span.style.cssText = 'display:block;font-size:10px;color:#8060b0;font-style:italic';
-        span.textContent = entry ? formatCountdown(entry.firstSeen, now) : 'Age unknown';
+        /* Absolute positioning anchored to bottom of status cell.
+           pointer-events:none — never blocks the Join tap. */
+        span.style.cssText = [
+          'position:absolute',
+          'bottom:1px',
+          'left:0',
+          'right:0',
+          'text-align:center',
+          'font-size:9px',
+          'font-weight:600',
+          'line-height:1.2',
+          'color:#c080f0',
+          'pointer-events:none',
+          'z-index:100',
+          'white-space:nowrap',
+          'overflow:hidden',
+          'text-overflow:ellipsis',
+        ].join(';');
+        span.textContent = entry ? formatCountdown(entry.firstSeen, t) : 'Age unknown';
         statusCell.appendChild(span);
       });
     } catch (e) { /* defensive — never crash the tracker */ }
@@ -880,6 +970,9 @@
       const spans = document.querySelectorAll('[data-rrmt-timer]');
       for (let i = 0; i < spans.length; i++) {
         const s = spans[i];
+        /* Restore CSS overrides we applied to the parent status cell */
+        const par = s.parentElement;
+        if (par) { par.style.overflow = ''; par.style.position = ''; }
         if (s.parentNode) s.parentNode.removeChild(s);
       }
     } catch (e) { /* defensive */ }
@@ -898,7 +991,7 @@
     /* Update inline lobby row timers */
     updateLobbyTimers(now);
     /* Re-inject for any new rows that appeared since last scan */
-    injectLobbyTimers();
+    injectLobbyTimers(now);
   }
 
   /* ============================ 8. UI ============================ */
