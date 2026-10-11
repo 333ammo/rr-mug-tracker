@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RR Mug Tracker
 // @namespace    fatboy.torn
-// @version      1.1.0
+// @version      1.1.1
 // @description  Russian Roulette lobby tracker with disappearance-watch intelligence for Torn PDA (iOS) and desktop.
 // @author       FATBOY [572123]
 // @match        https://www.torn.com/page.php*
@@ -13,6 +13,24 @@
 // ==/UserScript==
 
 /*
+ * RR Mug Tracker v1.1.1 — Strict minimum-bet filtering: effective threshold = max(Min Bet, Min Watch Bet).
+ *
+ * v1.1.1 changes:
+ *   - Bug fix: the main lobby game list was showing all observed games regardless of Min Bet; only
+ *     the counter was filtered.  Games with known bets below the effective threshold are now excluded
+ *     from the lobby display entirely.
+ *   - Effective eligibility threshold = max(Min Bet, Min Watch Bet) applied consistently to:
+ *       • lobby game-card display
+ *       • lobby counter ("X games observed")
+ *       • Disappearance Watch candidate display
+ *       • DisappearanceEngine confirmation gate (observeSnapshot)
+ *       • DisappearanceEngine getDueChecks (status-API scheduling gate)
+ *   - Null-bet (unknown wager) games remain always eligible.
+ *   - Raising either threshold immediately removes newly ineligible games from display and API checks.
+ *   - Lowering either threshold immediately re-admits newly eligible games.
+ *   - Existing history and exports are not affected by threshold changes.
+ *   - Suite Y added: 10 regression tests (Y1–Y10) covering the corrected filtering behaviour.
+ *
  * RR Mug Tracker v1.1.0 — Status checks ON by default, Min Watch Bet eligibility gate, collapsible History &
  *   Diagnostics panel, compact icon action buttons.
  *
@@ -344,7 +362,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.1.0';
+  const VERSION = '1.1.1';
   if (window.top !== window.self) return;
 
   /* isRRPage accepts optional (pn, qs) args for test-harness use */
@@ -1530,8 +1548,8 @@
              from confirming a game that may be in the middle of a React rerender */
           if (entry.candidateTs !== null &&
               (timestamp - entry.candidateTs) >= DE_CONFIRM_DEBOUNCE_MS) {
-            /* v1.1.0 eligibility gate: known bets below Min Watch Bet are not confirmed */
-            var _thresh = State.dwWatchMin;
+            /* v1.1.1 eligibility gate: effective threshold = max(Min Bet, Min Watch Bet) */
+            var _thresh = Math.max(State.minBet, State.dwWatchMin);
             if (_thresh > 0 && entry.bet !== null && entry.bet !== undefined && entry.bet < _thresh) {
               return; /* below threshold — stay CANDIDATE, no watch entry created */
             }
@@ -1608,11 +1626,11 @@
 
     function getDueChecks(timestamp) {
       var due = [];
-      var _dqThresh = State.dwWatchMin;
+      var _dqThresh = Math.max(State.minBet, State.dwWatchMin);
       _watches.forEach(function (entry) {
         if (entry.state !== 'CONFIRMED') return;
         if (!entry.playerId || !/^\d+$/.test(entry.playerId)) return;
-        /* v1.1.0: skip entries below the current threshold (handles post-confirmation threshold raises) */
+        /* v1.1.1: skip entries below effective threshold = max(minBet, dwWatchMin) */
         if (_dqThresh > 0 && entry.bet !== null && entry.bet !== undefined && entry.bet < _dqThresh) return;
         for (var i = 0; i < entry.statusChecks.length; i++) {
           var slot = entry.statusChecks[i];
@@ -2291,12 +2309,20 @@
       if (!host || !host.isConnected || !$bd) return;
       const now = Date.now();
       const games = Array.from(State.games.values());
+      /* v1.1.1: effective threshold = max(Min Bet, Min Watch Bet) applied to all display/eligibility paths */
+      var _eff = Math.max(State.minBet, State.dwWatchMin);
+      games.sort((a, b) => {
+        if (a.bet == null && b.bet != null) return 1;
+        if (a.bet != null && b.bet == null) return -1;
+        if (a.bet !== b.bet) return (b.bet || 0) - (a.bet || 0);
+        return (a.firstSeen || 0) - (b.firstSeen || 0);
+      });
+      var dispGames = _eff > 0 ? games.filter(function(g) { return g.bet == null || g.bet >= _eff; }) : games;
       let html = '';
 
       html += '<div class="bar"><span class="dot ' + (State.tracking ? 'on' : 'off') + '"></span>';
-      html += '<strong style="color:#c080f0">' + games.length + '</strong>&nbsp;game' + (games.length !== 1 ? 's' : '') + ' observed';
-      const q = games.filter(g => g.bet == null || g.bet >= State.minBet).length;
-      if (q !== games.length) html += '&nbsp;&middot;&nbsp;<strong style="color:#c080f0">' + q + '</strong>&nbsp;&ge;&nbsp;min bet';
+      html += '<strong style="color:#c080f0">' + dispGames.length + '</strong>&nbsp;game' + (dispGames.length !== 1 ? 's' : '') + ' observed';
+      if (dispGames.length < games.length) html += '&nbsp;&middot;&nbsp;' + (games.length - dispGames.length) + ' below min bet';
       html += '</div>';
 
       if (State.parseOk === false) {
@@ -2305,15 +2331,11 @@
 
       if (!games.length) {
         html += '<div class="empty">' + (State.tracking ? 'Watching for games\u2026' : 'Paused. Tap \u25B6 to start.') + '</div>';
+      } else if (!dispGames.length) {
+        html += '<div class="empty">All observed games are below your minimum bet.</div>';
       } else {
-        games.sort((a, b) => {
-          if (a.bet == null && b.bet != null) return 1;
-          if (a.bet != null && b.bet == null) return -1;
-          if (a.bet !== b.bet) return (b.bet || 0) - (a.bet || 0);
-          return (a.firstSeen || 0) - (b.firstSeen || 0);
-        });
-        for (const g of games) {
-          const hi       = g.bet != null && g.bet >= State.minBet;
+        for (const g of dispGames) {
+          const hi       = g.bet != null && g.bet >= _eff;
           const profURL  = tornProfileURL(g.playerId);
           const atkURL   = tornAttackURL(g.playerId);
           html += '<div class="gm' + (hi ? ' hi' : '') + '">';
@@ -2341,8 +2363,9 @@
       /* ── Disappearance Watch ── */
       var dwCands    = DisappearanceEngine.getCandidates();
       var dwHist     = DisappearanceEngine.getHistory();
-      var dwFiltered = State.dwWatchMin > 0
-        ? dwCands.filter(function (c) { return c.bet == null || c.bet >= State.dwWatchMin; })
+      /* v1.1.1: DW display also uses effective threshold */
+      var dwFiltered = _eff > 0
+        ? dwCands.filter(function (c) { return c.bet == null || c.bet >= _eff; })
         : dwCands;
       html += '<div class="dws">';
       html += '<div class="dwsh">\uD83D\uDC41 Disappearance Watch';
@@ -2882,7 +2905,7 @@
         DisappearanceEngine, StatusChecker,
         PersistenceStore,
         DE_HISTORY_MAX, DE_STORE_VERSION,
-        DW_PREF_KEY, DEFAULT_DW_MIN_BET, STATUS_PREF_KEY,
+        DW_PREF_KEY, DEFAULT_DW_MIN_BET, DEFAULT_MIN_BET, STATUS_PREF_KEY,
         exportHistoryJSON, exportHistoryCSV, importHistoryJSON,
       };
     }
