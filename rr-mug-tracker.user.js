@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RR Mug Tracker
 // @namespace    fatboy.torn
-// @version      0.1.8
+// @version      0.2.0
 // @description  Russian Roulette lobby tracker for Torn PDA (iOS): observe active games, log events, show elapsed time.
 // @author       FATBOY [572123]
 // @match        https://www.torn.com/page.php*
@@ -10,6 +10,26 @@
 // ==/UserScript==
 
 /*
+ * RR Mug Tracker v0.2.0 — Phase 2A: player profile and attack links.
+ * No API calls, no auto-play, no attacks, no mugging.
+ *
+ * v0.2.0 changes:
+ *   - tornProfileURL(pid) / tornAttackURL(pid): pure URL builders that validate
+ *     the player ID with /^\d+$/ before constructing any URL.  Both return null
+ *     for empty, null, or non-numeric IDs; links are rendered disabled in that case.
+ *   - Each game card in the panel now shows:
+ *       • Player name  +  #playerID  (same line, flex-spaced)
+ *       • Bet, player count, game ID  (existing row, label changed to "Game:")
+ *       • Observed age and countdown   (unchanged)
+ *       • [Profile]  [Attack]  tap-only link row at the bottom of each card
+ *   - Profile opens https://www.torn.com/profiles.php?XID={pid}
+ *   - Attack  opens https://www.torn.com/loader.php?sid=attack&user2ID={pid}
+ *     Both are standard Torn URLs confirmed compatible with Torn PDA iOS.
+ *     Navigation requires an explicit user tap; nothing is visited automatically.
+ *   - New CSS classes: .gnm .gid .gl and variants for the link row.
+ *   - .gn updated to a flex row so name + ID are spaced on one line.
+ *   - Suite O added: 7 regression tests for URL building and validation (O1-O7).
+ *
  * RR Mug Tracker v0.1.8 — make inline lobby countdown visible on Torn PDA iOS.
  * No API calls, no auto-play, no attacks, no mugging.
  *
@@ -154,7 +174,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '0.1.8';
+  const VERSION = '0.2.0';
   if (window.top !== window.self) return;
 
   /* isRRPage accepts optional (pn, qs) args for test-harness use */
@@ -230,6 +250,20 @@
       .replace(/\bgame=\d+/g, 'game=N')
       .replace(/[?&](?:key|token|auth|api[-_]?key)=[^&#]*/gi, '')
       .slice(0, 80);
+  }
+
+  /* tornProfileURL / tornAttackURL — build validated Torn navigation URLs.
+     Both accept only a strictly numeric playerId string.  Any other input
+     (null, empty, non-numeric, mixed) returns null so the caller can render
+     the link in a disabled state rather than constructing a broken URL. */
+  function tornProfileURL(pid) {
+    if (!pid || !/^\d+$/.test(String(pid))) return null;
+    return 'https://www.torn.com/profiles.php?XID=' + pid;
+  }
+
+  function tornAttackURL(pid) {
+    if (!pid || !/^\d+$/.test(String(pid))) return null;
+    return 'https://www.torn.com/loader.php?sid=attack&user2ID=' + pid;
   }
 
   function getPlayerName(link) {
@@ -1015,10 +1049,16 @@
       '.dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}.dot.on{background:#5cb85c}.dot.off{background:#555}',
       '.gm{padding:6px 8px;margin-bottom:4px;border-radius:7px;border:1px solid #1e1030;background:#100820}',
       '.gm.hi{border-color:#6a2a9a;background:#16082a}',
-      '.gn{font-weight:600;color:#c080f0;font-size:13px}',
+      '.gn{display:flex;align-items:baseline;justify-content:space-between;gap:4px;flex-wrap:nowrap}',
+      '.gnm{font-weight:600;color:#c080f0;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1 1 0}',
+      '.gid{font-size:10px;color:#4a3060;flex-shrink:0;font-weight:400;white-space:nowrap}',
       '.gx{font-size:11px;color:#8060a0;margin-top:2px}',
       '.ga{font-size:11px;color:#4a3060;margin-top:1px}',
       '.ge{font-size:10px;color:#6a4a7a;font-style:italic}',
+      '.gl{display:flex;gap:5px;margin-top:5px}',
+      '.gl a{flex:1;padding:5px 2px;text-align:center;border-radius:5px;border:1px solid #3a1a5a;background:#0c0420;color:#9070b0;font-size:11px;font-weight:600;text-decoration:none;touch-action:manipulation;-webkit-tap-highlight-color:transparent;display:block;cursor:pointer}',
+      '.gl a.dis{opacity:.35;pointer-events:none;cursor:default}',
+      '.gl a.atk{border-color:#4a1a2a;color:#c06070}',
       '.ok{color:#5cb85c}',
       '.empty{padding:18px 0;text-align:center;color:#4a3060;font-size:12px}',
       '.warn{padding:7px 9px;margin-bottom:5px;border-radius:6px;background:#1e1010;border:1px solid #4a1a1a;color:#b07070;font-size:11px}',
@@ -1070,14 +1110,27 @@
           return (a.firstSeen || 0) - (b.firstSeen || 0);
         });
         for (const g of games) {
-          const hi = g.bet != null && g.bet >= State.minBet;
+          const hi       = g.bet != null && g.bet >= State.minBet;
+          const profURL  = tornProfileURL(g.playerId);
+          const atkURL   = tornAttackURL(g.playerId);
           html += '<div class="gm' + (hi ? ' hi' : '') + '">';
-          html += '<div class="gn">' + esc(g.playerName) + '</div>';
+          /* Name row: player name (truncatable) + numeric player ID */
+          html += '<div class="gn"><span class="gnm">' + esc(g.playerName) + '</span>';
+          if (g.playerId) html += '<span class="gid">#' + esc(g.playerId) + '</span>';
+          html += '</div>';
+          /* Bet row */
           html += '<div class="gx">Bet:&nbsp;<span' + (hi ? ' class="ok"' : '') + '>' + esc(fmtBet(g.bet)) + '</span>';
           if (g.playerCount != null) html += '&nbsp;&middot;&nbsp;Players:&nbsp;' + g.playerCount;
-          if (g.gameId) html += '&nbsp;&middot;&nbsp;<span style="color:#3a2050;font-size:10px">ID:' + esc(g.gameId) + '</span>';
-          html += '</div><div class="ga">Observed: ' + esc(formatAge(g.firstSeen, now)) + '</div>';
+          if (g.gameId) html += '&nbsp;&middot;&nbsp;<span style="color:#3a2050;font-size:10px">Game:' + esc(g.gameId) + '</span>';
+          html += '</div>';
+          /* Age + countdown */
+          html += '<div class="ga">Observed: ' + esc(formatAge(g.firstSeen, now)) + '</div>';
           html += '<div class="ge" id="rrmt-tm-' + esc(g.gameKey) + '">Est. remaining (\u224815 min, not guaranteed): ' + esc(formatCountdown(g.firstSeen, now)) + '</div>';
+          /* Profile / Attack tap links — disabled if playerId is invalid */
+          html += '<div class="gl">';
+          html += '<a' + (profURL ? ' href="' + esc(profURL) + '"' : '') + ' class="prf' + (profURL ? '' : ' dis') + '">Profile</a>';
+          html += '<a' + (atkURL  ? ' href="' + esc(atkURL)  + '"' : '') + ' class="atk' + (atkURL  ? '' : ' dis') + '">Attack</a>';
+          html += '</div>';
           html += '</div>';
         }
       }
@@ -1239,6 +1292,7 @@
       window.__RRMT_TEST__ = {
         VERSION, isRRPage, parseBet, parseMinBet, gameKey,
         formatAge, estimatedRemaining, formatCountdown,
+        tornProfileURL, tornAttackURL,
         safeClass, sanitizeHref, getPlayerName,
         _isSectionCandidate, findGamesSection, findRowsWrap, findRowContainer, extractGameIdFromEl,
         parseRRLobby, processGames,
