@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RR Mug Tracker
 // @namespace    fatboy.torn
-// @version      0.1.2
+// @version      0.1.3
 // @description  Russian Roulette lobby tracker for Torn PDA (iOS): observe active games, log events, show elapsed time.
 // @author       FATBOY [572123]
 // @match        https://www.torn.com/page.php*
@@ -10,8 +10,22 @@
 // ==/UserScript==
 
 /*
- * RR Mug Tracker v0.1.2 — diagnostic update.
+ * RR Mug Tracker v0.1.3 — fix wrong container selection.
  * No API calls, no auto-play, no attacks, no mugging.
+ *
+ * v0.1.3 changes:
+ *   - findGamesSection() rewritten.  "[class*="available"]" is removed from
+ *     all CSS fallback selectors — it matched SPAN.bustr-stats__availableBusts
+ *     (a different userscript's element) instead of the RR game list.
+ *   - Heading search now covers any element type (not just h1-h6), since Torn
+ *     may use div/span/th for the "List of available games" label.
+ *   - _isSectionCandidate() helper: rejects any element with 0 children so a
+ *     leaf/chrome element can never be accepted as the game list container.
+ *   - CSS fallback list is now RR-specific: createWrap, gameWrap, etc.
+ *   - captureDomDiag() gains three new sections: headingPath (ancestry of the
+ *     "List of available games" heading), profileLinks (sample of 8 body-level
+ *     profile links with parent/sibling context), rowDataAttrs (data-* attrs on
+ *     section children — candidate game-ID carriers).
  *
  * v0.1.2 changes (diagnostic only — parser unchanged):
  *   - captureDomDiag() completely rewritten. No longer relies on profile
@@ -46,7 +60,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '0.1.2';
+  const VERSION = '0.1.3';
   if (window.top !== window.self) return;
 
   /* isRRPage accepts optional (pn, qs) args for test-harness use */
@@ -165,25 +179,71 @@
     return el.parentElement;
   }
 
+  /*
+   * _isSectionCandidate — a container is trustworthy only if it has child
+   * elements.  This rejects leaf nodes, body/html, and 0-children elements
+   * such as SPAN.bustr-stats__availableBusts (a different userscript's stat
+   * badge that matches "[class*="available"]" but contains no game rows).
+   */
+  function _isSectionCandidate(el) {
+    if (!el) return false;
+    if (el === document.body || el === document.documentElement) return false;
+    return el.children.length > 0;
+  }
+
   function findGamesSection() {
     try {
-      const headings = document.querySelectorAll('h1,h2,h3,h4,h5,h6,strong,b');
-      for (let i = 0; i < headings.length; i++) {
-        if (/list of available games/i.test(headings[i].textContent)) {
-          return headings[i].closest('section,article,[class*="content"],[class*="wrap"],div') ||
-                 headings[i].parentElement;
+      /*
+       * 1. Search for the "List of available games" heading in any element
+       *    type — Torn may use div/span/th, not only h1-h6.
+       *    Only consider elements whose full textContent is short (≤ 120 chars)
+       *    so we don't accidentally match large page containers.
+       */
+      const headEls = document.querySelectorAll(
+        'h1,h2,h3,h4,h5,h6,strong,b,span,div,p,label,th,td'
+      );
+      for (let i = 0; i < headEls.length; i++) {
+        const el = headEls[i];
+        const tx = el.textContent.replace(/\s+/g, ' ').trim();
+        if (tx.length > 120 || !/list of available games/i.test(tx)) continue;
+        /* Walk up: first ancestor with >1 child (heading + at least one row) */
+        let cur = el.parentElement;
+        for (let d = 0; cur && d < 8; d++, cur = cur.parentElement) {
+          if (cur === document.body || cur === document.documentElement) break;
+          if (cur.children.length > 1 && _isSectionCandidate(cur)) return cur;
+        }
+        /* The next sibling of the heading element might be the list */
+        const sib = el.nextElementSibling;
+        if (sib && _isSectionCandidate(sib)) return sib;
+        /* Direct parent as last resort */
+        if (el.parentElement && _isSectionCandidate(el.parentElement)) {
+          return el.parentElement;
         }
       }
-      const sels = [
-        '[class*="available"]', '[class*="game-list"]', '[class*="gameList"]',
-        '[class*="roulette-lobby"]', '[class*="rouletteLobby"]',
-        '[id*="available"]', '[id*="game-list"]',
-      ];
-      for (let j = 0; j < sels.length; j++) {
-        const el = document.querySelector(sels[j]);
-        if (el) return el;
-      }
     } catch (e) { /* ignore */ }
+
+    /*
+     * 2. RR-specific CSS-module class fragments.
+     *    "[class*="available"]" is deliberately absent — it is too broad and
+     *    matched SPAN.bustr-stats__availableBusts in live testing.
+     *    All candidates here must also pass _isSectionCandidate().
+     */
+    const rrSels = [
+      '[class*="createWrap"]',
+      '[class*="gameWrap"]',
+      '[class*="rouletteLobby"]',
+      '[class*="rouletteList"]',
+      '[class*="russianRoulette"]',
+      '[class*="game-list"]', '[class*="gameList"]',
+      '[id*="available"]',    '[id*="game-list"]',
+    ];
+    for (let j = 0; j < rrSels.length; j++) {
+      try {
+        const el = document.querySelector(rrSels[j]);
+        if (el && _isSectionCandidate(el)) return el;
+      } catch (e) { /* skip */ }
+    }
+
     return null;
   }
 
@@ -393,10 +453,89 @@
     }
     let tree = sec ? treeOf(sec, 0) : null;
 
+    /* 8 — ancestry path of the "List of available games" heading element */
+    let headingPath = null;
+    try {
+      const hEls = document.querySelectorAll(
+        'h1,h2,h3,h4,h5,h6,strong,b,span,div,p,label,th,td'
+      );
+      for (let i = 0; i < hEls.length; i++) {
+        const el = hEls[i];
+        const tx = el.textContent.replace(/\s+/g, ' ').trim();
+        if (tx.length > 120 || !/list of available games/i.test(tx)) continue;
+        headingPath = [];
+        let cur = el;
+        for (let d = 0; cur && cur !== document.body && d < 6; d++, cur = cur.parentElement) {
+          headingPath.push({
+            tag:  cur.tagName,
+            cls:  clsOf(cur).slice(0, 80),
+            id:   cur.id || undefined,
+            kids: cur.children.length,
+          });
+        }
+        break;
+      }
+    } catch (e) {}
+
+    /* 9 — sample of up to 8 body-level profile links with parent/sibling context */
+    const profileLinkSample = [];
+    try {
+      document.querySelectorAll('a[href*="/profiles.php"]').forEach(a => {
+        if (skip(a) || profileLinkSample.length >= 8) return;
+        const par = a.parentElement;
+        const gpar = par && par.parentElement;
+        const sibs = par ? Array.from(par.children).filter(c => c !== a) : [];
+        profileLinkSample.push({
+          href:   sanitizeHref(a.getAttribute('href') || ''),
+          tx:     a.textContent.replace(/\s+/g, ' ').trim().slice(0, 30),
+          pTag:   par ? par.tagName : null,
+          pCls:   par ? clsOf(par).slice(0, 60) : null,
+          gpTag:  gpar ? gpar.tagName : null,
+          gpCls:  gpar ? clsOf(gpar).slice(0, 60) : null,
+          sibTx:  sibs.slice(0, 3).map(s => s.textContent.replace(/\s+/g, ' ').trim().slice(0, 30)).join(' | '),
+        });
+      });
+    } catch (e) {}
+
+    /* 10 — data-* attributes on section children (candidate game-ID carriers) */
+    const rowDataAttrs = [];
+    if (sec) {
+      try {
+        Array.from(sec.children).slice(0, 6).forEach(el => {
+          const attrs = {};
+          for (const attr of el.attributes) {
+            if (/^data-/i.test(attr.name) && !/token|auth|key|api|csrf/i.test(attr.name)) {
+              attrs[attr.name] = attr.value.slice(0, 40);
+            }
+          }
+          /* Also check shallow descendants for game-ID data attrs */
+          try {
+            el.querySelectorAll('[data-id],[data-game],[data-game-id],[data-entry-id]').forEach(sub => {
+              for (const attr of sub.attributes) {
+                if (/^data-/i.test(attr.name) && !/token|auth|key|api|csrf/i.test(attr.name)) {
+                  const k = 'sub.' + sub.tagName + '.' + attr.name;
+                  attrs[k] = attr.value.slice(0, 40);
+                }
+              }
+            });
+          } catch (e) {}
+          if (Object.keys(attrs).length || el.id) {
+            rowDataAttrs.push({
+              tag:  el.tagName,
+              cls:  clsOf(el).slice(0, 60),
+              id:   el.id || undefined,
+              attrs,
+            });
+          }
+        });
+      } catch (e) {}
+    }
+
     const diag = {
       v: VERSION, ts, loc,
       bodyLinks: { profile: bodyProfile, withGame: bodyGame },
       heads, cands, sec: secInfo, rows, tree,
+      headingPath, profileLinks: profileLinkSample, rowDataAttrs,
     };
 
     let out = JSON.stringify(diag, null, 2);
@@ -766,7 +905,7 @@
         VERSION, isRRPage, parseBet, parseMinBet, gameKey,
         formatAge, estimatedRemaining,
         safeClass, sanitizeHref, getPlayerName,
-        findGamesSection, findRowContainer, extractGameIdFromEl,
+        _isSectionCandidate, findGamesSection, findRowContainer, extractGameIdFromEl,
         parseRRLobby, processGames,
         logEvent, exportLog, captureDomDiag,
         startTracking, stopTracking, State, UI,
