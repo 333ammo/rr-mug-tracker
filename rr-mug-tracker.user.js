@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RR Mug Tracker
 // @namespace    fatboy.torn
-// @version      0.1.1
+// @version      0.1.2
 // @description  Russian Roulette lobby tracker for Torn PDA (iOS): observe active games, log events, show elapsed time.
 // @author       FATBOY [572123]
 // @match        https://www.torn.com/page.php*
@@ -10,32 +10,43 @@
 // ==/UserScript==
 
 /*
- * RR Mug Tracker v0.1.1 — Phase 1: read-only lobby observer.
+ * RR Mug Tracker v0.1.2 — diagnostic update.
  * No API calls, no auto-play, no attacks, no mugging.
  *
- * v0.1.1 fixes (live Torn PDA test):
- *   - findRowContainer: was returning the player cell div; now returns its
- *     parent so bet-column text is included in parseBet().
- *   - Player name: now uses direct text nodes only to exclude nested spans
- *     like <span>Premium data</span> that inflate the visible name.
- *   - UI-chrome profile links (text = "View Profile" etc.) are filtered out.
- *   - Own panel host is excluded from all DOM scans.
- *   - Added findGamesSection() to narrow the scan scope.
- *   - Added "Copy DOM diagnostics" button for post-test structure inspection.
+ * v0.1.2 changes (diagnostic only — parser unchanged):
+ *   - captureDomDiag() completely rewritten. No longer relies on profile
+ *     links (which were 0 in live test). Instead captures:
+ *       • page pathname + sid parameter
+ *       • all headings on the page
+ *       • candidate RR containers found by CSS-module-aware selectors
+ *       • findGamesSection() result with parent, sibling, ANY link sample
+ *       • direct children of the found section (up to 12 "rows")
+ *       • bounded depth-3 element tree of the section
+ *       • body-level counts for profile links AND ?game= links
+ *   - Diagnostic output now shown in a visible, selectable textarea inside
+ *     the panel so it can be manually copied if navigator.clipboard fails
+ *     (triple-tap → select all → copy on iOS).
+ *   - Copy button shows "Copied!" / "See text ↓" feedback.
+ *   - safeClass() and sanitizeHref() extracted as testable helpers.
  *
- * DOM ASSUMPTIONS — require live Torn PDA re-verification with v0.1.1:
- *   1. Player profile links: href="/profiles.php?XID=[id]"
- *   2. Each game row is a TR or a DIV that is the parent of player/bet/action
- *      child divs.  The bet amount is in a sibling cell of the player cell.
- *   3. Bet amounts appear as "$[digits,]+" somewhere in the row text.
- *   4. Game IDs are in link hrefs (?game=N) or data-game-id attributes.
- *   5. Player names are the direct text content of the profile link, not
- *      text from nested child elements.
+ * v0.1.1 fixes (live Torn PDA test):
+ *   - findRowContainer: now returns parent row div (was returning player cell).
+ *   - Player name: direct text nodes only (excludes nested <span>).
+ *   - UI-chrome "View Profile" links filtered by UI_LABEL.
+ *   - Own panel host excluded from DOM scans.
+ *   - findGamesSection() added.
+ *
+ * DOM ASSUMPTIONS — require live Torn PDA re-verification:
+ *   1. Player profile links: href="/profiles.php?XID=[id]"  (0 found in last test)
+ *   2. Bet amounts appear as "$[digits,]+" in row text.
+ *   3. Game IDs in link hrefs (?game=N) or data-game-id.
+ *   These assumptions may be wrong — the v0.1.2 diagnostic output will
+ *   reveal the actual DOM structure for the next parser rewrite.
  */
 (function () {
   'use strict';
 
-  const VERSION = '0.1.1';
+  const VERSION = '0.1.2';
   if (window.top !== window.self) return;
 
   /* isRRPage accepts optional (pn, qs) args for test-harness use */
@@ -65,12 +76,14 @@
 
   /* ============================ 2. STATE ============================ */
   const State = {
-    games:    new Map(),  // key → GameEntry
-    log:      [],
-    tracking: false,
-    parseOk:  null,       // null=not tried, true=ok, false=failed
+    games:     new Map(),  // key → GameEntry
+    log:       [],
+    tracking:  false,
+    parseOk:   null,       // null=not tried, true=ok, false=failed
     parseNote: '',
-    minBet:   DEFAULT_MIN_BET,
+    minBet:    DEFAULT_MIN_BET,
+    diagOutput: null,      // set when user presses Copy DOM diagnostics
+    diagMsg:    null,      // transient copy feedback message
   };
 
   /* ============================ 3. PARSING ============================ */
@@ -96,11 +109,21 @@
     return gameId ? ('g' + gameId) : ('p' + playerId);
   }
 
-  /*
-   * getPlayerName — extract the player's name from a profile link using only
-   * direct text nodes.  This intentionally excludes nested elements such as
-   * <span>Premium data</span> that Torn injects inside the anchor.
-   */
+  /* safeClass — safely read className as string (handles SVGAnimatedString) */
+  function safeClass(el) {
+    const c = el.className;
+    return (typeof c === 'string') ? c : ((c && c.baseVal) ? c.baseVal : '');
+  }
+
+  /* sanitizeHref — mask player/game IDs and remove credential params */
+  function sanitizeHref(raw) {
+    return (raw || '')
+      .replace(/XID=\d+/g, 'XID=X')
+      .replace(/\bgame=\d+/g, 'game=N')
+      .replace(/[?&](?:key|token|auth|api[-_]?key)=[^&#]*/gi, '')
+      .slice(0, 80);
+  }
+
   function getPlayerName(link) {
     let name = '';
     for (let i = 0; i < link.childNodes.length; i++) {
@@ -108,7 +131,6 @@
     }
     name = name.trim();
     if (!name) {
-      /* Fallback: full textContent minus known noise — covers edge cases */
       name = link.textContent
         .replace(/\bPremium\s*data\b/gi, '')
         .replace(/\bView\s*Profile\b/gi, '')
@@ -129,16 +151,6 @@
     return d ? (d.dataset && d.dataset.gameId) || null : null;
   }
 
-  /*
-   * findRowContainer — walk up from a profile link to the containing game row.
-   *
-   * v0.1.0 bug: returned the player-cell DIV itself when it had sibling DIVs,
-   * so parseBet() only saw the player column's text (no bet).
-   *
-   * v0.1.1 fix: when a DIV has >= 1 sibling DIVs it is likely a *cell*, so
-   * return its *parent* (the row) instead.  TR and LI are returned directly
-   * as before because they are already the row-level element.
-   */
   function findRowContainer(el) {
     const STOP = { LI: 1, TR: 1, ARTICLE: 1, SECTION: 1 };
     let cur = el.parentElement;
@@ -153,11 +165,6 @@
     return el.parentElement;
   }
 
-  /*
-   * findGamesSection — try to narrow the scan root to the "List of available
-   * games" section.  Returns null if not found; caller falls back to body.
-   * All selector queries are wrapped in try/catch for resilience.
-   */
   function findGamesSection() {
     try {
       const headings = document.querySelectorAll('h1,h2,h3,h4,h5,h6,strong,b');
@@ -185,9 +192,7 @@
     const ownHost = document.getElementById(NS + '-host');
 
     const links = Array.from(r.querySelectorAll('a[href*="/profiles.php?XID="]')).filter(a => {
-      /* Exclude links inside the tracker's own panel */
       if (ownHost && ownHost.contains(a)) return false;
-      /* Exclude UI-chrome links by full link text */
       if (UI_LABEL.test(a.textContent.trim())) return false;
       return true;
     });
@@ -223,45 +228,184 @@
   }
 
   /*
-   * captureDomDiag — build a sanitised structural snapshot of the RR lobby
-   * DOM to help diagnose parsing issues after a live Torn PDA test.
-   * XID values are masked.  No network calls; clipboard-only.
+   * captureDomDiag — v0.1.2 rewrite.
+   *
+   * Does NOT rely on profile links.  Captures structural information about the
+   * RR lobby DOM regardless of how game rows are implemented.  Designed to
+   * answer: what elements are inside the found section, what links exist,
+   * what class names does Torn use, what does the element tree look like?
+   *
+   * Safe to call at any time.  Only runs when the button is pressed.
+   * Does NOT transmit data anywhere — clipboard or visible textarea only.
    */
   function captureDomDiag() {
-    const ownHost = document.getElementById(NS + '-host');
-    const root    = findGamesSection() || document.body;
-    const allLinks = Array.from(
-      root.querySelectorAll('a[href*="/profiles.php?XID="]')
-    ).filter(a => !(ownHost && ownHost.contains(a)));
+    const own = document.getElementById(NS + '-host');
+    const ts  = new Date().toISOString().slice(0, 19);
+    const skip = el => !!(own && own.contains(el));
+    const clsOf = el => safeClass(el).slice(0, 100);
+    const txOf  = el => el.textContent.replace(/\s+/g, ' ').trim().slice(0, 80);
 
-    const linksInfo = allLinks.slice(0, 12).map(a => {
-      let directText = '';
-      for (let i = 0; i < a.childNodes.length; i++) {
-        if (a.childNodes[i].nodeType === 3) directText += a.childNodes[i].nodeValue;
-      }
-      const row = findRowContainer(a);
-      return {
-        fullText:   a.textContent.trim().slice(0, 60),
-        directText: directText.trim().slice(0, 60),
-        href:       (a.getAttribute('href') || '').replace(/XID=\d+/g, 'XID=X').replace(/game=\d+/g, 'game=N'),
-        parentTag:  a.parentElement ? a.parentElement.tagName : '',
-        parentCls:  (a.parentElement && typeof a.parentElement.className === 'string')
-                      ? a.parentElement.className.slice(0, 50) : '',
-        rowTag:     row ? row.tagName : '',
-        rowCls:     (row && typeof row.className === 'string') ? row.className.slice(0, 50) : '',
-        rowSnippet: row ? row.textContent.replace(/\s+/g, ' ').trim().slice(0, 100) : '',
+    /* 1 — page location */
+    const loc = {
+      pn:  location.pathname,
+      qs:  location.search,
+      sid: ((/[?&]sid=([^&#]*)/.exec(location.search)) || [])[1] || null,
+    };
+
+    /* 2 — body-level link counts (quick orientation) */
+    let bodyProfile = 0, bodyGame = 0;
+    try { bodyProfile = document.querySelectorAll('a[href*="/profiles.php"]').length; } catch(e){}
+    try { bodyGame    = document.querySelectorAll('a[href*="game="]').length; } catch(e){}
+
+    /* 3 — headings visible on the page */
+    const heads = [];
+    try {
+      document.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(h => {
+        if (skip(h) || heads.length >= 8) return;
+        heads.push({ tag: h.tagName, cls: clsOf(h), tx: h.textContent.replace(/\s+/g, ' ').trim().slice(0, 70) });
+      });
+    } catch(e) {}
+
+    /* 4 — candidate containers via CSS-module-aware selectors
+           These are NOT profile-link based — they probe class names directly */
+    const candSels = [
+      '[class*="available"]', '[class*="game-list"]', '[class*="gameList"]',
+      '[class*="roulette"]',  '[class*="russian"]',   '[class*="lobby"]',
+      '[class*="waiting"]',   '[class*="tableWrap"]', '[class*="tableRow"]',
+      '[class*="gameRow"]',   '[class*="listItem"]',  '[class*="rowWrap"]',
+      '[class*="createWrap"]','[class*="playerWrap"]','[class*="betWrap"]',
+    ];
+    const cands = []; const seenC = new WeakSet();
+    for (const sel of candSels) {
+      if (cands.length >= 14) break;
+      try {
+        document.querySelectorAll(sel).forEach(el => {
+          if (skip(el) || seenC.has(el) || cands.length >= 14) return;
+          seenC.add(el);
+          cands.push({
+            sel,
+            tag: el.tagName,
+            cls: clsOf(el),
+            id:  el.id || undefined,
+            kids: el.children.length,
+            anyLinks: el.querySelectorAll('a[href]').length,
+            tx:  txOf(el).slice(0, 60),
+          });
+        });
+      } catch(e) {}
+    }
+
+    /* 5 — findGamesSection() result with richer context */
+    const sec = findGamesSection();
+    let secInfo = null;
+    if (sec) {
+      let secAnyLinks = 0, secPLinks = 0;
+      try { secAnyLinks = sec.querySelectorAll('a[href]').length; } catch(e){}
+      try { secPLinks   = sec.querySelectorAll('a[href*="/profiles.php"]').length; } catch(e){}
+      const linkSample = [];
+      try {
+        sec.querySelectorAll('a[href]').forEach(a => {
+          if (linkSample.length >= 8) return;
+          linkSample.push({
+            href: sanitizeHref(a.getAttribute('href') || ''),
+            tx:   a.textContent.replace(/\s+/g, ' ').trim().slice(0, 30),
+            pCls: clsOf(a.parentElement || a).slice(0, 50),
+          });
+        });
+      } catch(e) {}
+      secInfo = {
+        tag:          sec.tagName,
+        cls:          clsOf(sec),
+        id:           sec.id || undefined,
+        kids:         sec.children.length,
+        anyLinks:     secAnyLinks,
+        profileLinks: secPLinks,
+        linkSample,
+        parent: sec.parentElement ? {
+          tag:  sec.parentElement.tagName,
+          cls:  clsOf(sec.parentElement).slice(0, 80),
+          kids: sec.parentElement.children.length,
+        } : null,
+        prevSib: sec.previousElementSibling ? {
+          tag: sec.previousElementSibling.tagName,
+          cls: clsOf(sec.previousElementSibling).slice(0, 70),
+          tx:  txOf(sec.previousElementSibling).slice(0, 40),
+        } : null,
+        nextSib: sec.nextElementSibling ? {
+          tag:  sec.nextElementSibling.tagName,
+          cls:  clsOf(sec.nextElementSibling).slice(0, 70),
+          kids: sec.nextElementSibling.children.length,
+        } : null,
       };
-    });
+    }
 
-    return JSON.stringify({
-      v:               VERSION,
-      ts:              new Date().toISOString().slice(0, 19),
-      foundSection:    !!findGamesSection(),
-      rootTag:         root.tagName,
-      rootCls:         (typeof root.className === 'string') ? root.className.slice(0, 80) : '',
-      totalLinks:      allLinks.length,
-      links:           linksInfo,
-    }, null, 2);
+    /* 6 — direct children of the section (up to 12 potential game rows) */
+    const rows = [];
+    if (sec) {
+      Array.from(sec.children).slice(0, 12).forEach(el => {
+        const elLinks = [];
+        try {
+          el.querySelectorAll('a[href]').forEach(a => {
+            if (elLinks.length >= 4) return;
+            elLinks.push({
+              href: sanitizeHref(a.getAttribute('href') || ''),
+              tx:   a.textContent.replace(/\s+/g, ' ').trim().slice(0, 30),
+            });
+          });
+        } catch(e) {}
+        rows.push({
+          tag:  el.tagName,
+          cls:  clsOf(el).slice(0, 80),
+          id:   el.id || undefined,
+          kids: el.children.length,
+          links: elLinks,
+          tx:   txOf(el).slice(0, 80),
+        });
+      });
+    }
+
+    /* 7 — bounded depth tree of the section (tag / safe-attrs / direct-text / children)
+           Depth ≤ 3, ≤ 8 children per node.  Skips sensitive attribute names. */
+    const SKIP_ATTR = /^(value|src|action|data-token|data-auth|data-key|data-user|data-api|data-csrf)$/i;
+    function treeOf(el, d) {
+      if (!el || d > 3 || skip(el)) return null;
+      const node = { t: el.tagName };
+      const a = {};
+      for (const attr of el.attributes) {
+        if (SKIP_ATTR.test(attr.name)) continue;
+        const v = attr.name === 'href'
+          ? sanitizeHref(attr.value)
+          : attr.value.slice(0, 60);
+        a[attr.name] = v;
+      }
+      if (Object.keys(a).length) node.a = a;
+      let tx = '';
+      for (const n of el.childNodes) if (n.nodeType === 3) tx += n.nodeValue;
+      tx = tx.replace(/\s+/g, ' ').trim();
+      if (tx) node.tx = tx.slice(0, 40);
+      const ch = [];
+      for (let i = 0; i < Math.min(el.children.length, 8); i++) {
+        const c = treeOf(el.children[i], d + 1);
+        if (c) ch.push(c);
+      }
+      if (ch.length) node.ch = ch;
+      return node;
+    }
+    let tree = sec ? treeOf(sec, 0) : null;
+
+    const diag = {
+      v: VERSION, ts, loc,
+      bodyLinks: { profile: bodyProfile, withGame: bodyGame },
+      heads, cands, sec: secInfo, rows, tree,
+    };
+
+    let out = JSON.stringify(diag, null, 2);
+    /* Size guard — drop tree if output too large */
+    if (out.length > 18000) {
+      diag.tree = { note: 'omitted — size limit', chars: out.length };
+      out = JSON.stringify(diag, null, 2);
+    }
+    return out;
   }
 
   /* ============================ 4. LOG ============================ */
@@ -412,6 +556,12 @@
       '.cfg{padding:6px 0 3px;border-top:1px solid #1e1030;margin-top:4px;font-size:11px;color:#6a4a80;display:flex;align-items:center;gap:6px;flex-wrap:wrap}',
       '.cfg input{flex:1;min-width:90px;max-width:150px;padding:4px 7px;border-radius:5px;border:1px solid #3a1a5a;background:#080410;color:#ddd0f0;font:11px inherit}',
       '.lbtn{margin-top:5px;padding:5px 10px;border-radius:6px;border:1px solid #3a1a5a;background:#100820;color:#8060a0;font-size:11px;touch-action:manipulation}',
+      /* diagnostic output panel */
+      '.dg-wrap{margin-top:7px;border-top:1px solid #2a1040;padding-top:5px}',
+      '.dg-hd{display:flex;align-items:center;justify-content:space-between;font-size:11px;color:#8060b0;margin-bottom:3px}',
+      '.dg-msg{font-size:10px;color:#5cb85c;margin-bottom:3px}',
+      '.dg-hint{font-size:10px;color:#4a3060;font-style:italic;margin-bottom:4px}',
+      '.dg-ta{display:block;width:100%;height:130px;background:#040110;color:#9080c0;border:1px solid #2a1040;border-radius:4px;font:10px/1.3 "Courier New",monospace;padding:5px;resize:none;-webkit-user-select:text;user-select:text;white-space:pre;overflow:auto}',
     ].join('');
 
     function esc(s) {
@@ -470,15 +620,42 @@
       html += '<div class="cfg"><label>Min bet:&nbsp;<input id="rrmt-mb" type="text" value="' + esc(fmtBet(State.minBet)) + '" placeholder="e.g. 200M"></label></div>';
       html += '<button class="lbtn" id="rrmt-lb">Copy log (last 50)</button>';
       html += '&nbsp;<button class="lbtn" id="rrmt-diag">Copy DOM diagnostics</button>';
+
+      /* diagnostic output area — only rendered when State.diagOutput is set */
+      if (State.diagOutput) {
+        html += '<div class="dg-wrap">';
+        html += '<div class="dg-hd"><span>\uD83D\uDD0D Diagnostics captured</span>';
+        html += '<button class="lbtn" id="rrmt-dgclr">\u2715 Clear</button></div>';
+        if (State.diagMsg) {
+          html += '<div class="dg-msg">' + esc(State.diagMsg) + '</div>';
+        }
+        html += '<div class="dg-hint">If copy failed: tap text area below \u2192 triple-tap \u2192 select all \u2192 copy</div>';
+        html += '<textarea class="dg-ta" id="rrmt-dgta" readonly></textarea>';
+        html += '</div>';
+      }
+
       $bd.innerHTML = html;
 
       if ($tgl) $tgl.textContent = State.tracking ? '\u23F8' : '\u25B6';
+
+      /* set textarea value after innerHTML (avoids HTML-escaping the JSON) */
+      if (State.diagOutput) {
+        const ta = shadow.getElementById('rrmt-dgta');
+        if (ta) ta.value = State.diagOutput;
+        const clrBtn = shadow.getElementById('rrmt-dgclr');
+        if (clrBtn) clrBtn.addEventListener('click', () => {
+          State.diagOutput = null;
+          State.diagMsg    = null;
+          render();
+        });
+      }
 
       const mbEl = shadow.getElementById('rrmt-mb');
       if (mbEl) mbEl.addEventListener('change', function () {
         const v = parseMinBet(this.value);
         if (v && v > 0) { State.minBet = v; render(); }
       });
+
       const lbEl = shadow.getElementById('rrmt-lb');
       if (lbEl) lbEl.addEventListener('click', () => {
         const txt = exportLog(50);
@@ -486,12 +663,30 @@
           navigator.clipboard.writeText(txt).catch(() => fbCopy(txt));
         } else { fbCopy(txt); }
       });
+
       const diagEl = shadow.getElementById('rrmt-diag');
       if (diagEl) diagEl.addEventListener('click', () => {
         const txt = captureDomDiag();
+        State.diagOutput = txt;
+        State.diagMsg    = null;
+        render();
+
+        /* attempt clipboard copy after render (button ref may be stale — look it up again) */
+        const btn = shadow.getElementById('rrmt-diag');
+        const setMsg = (msg, colour) => {
+          State.diagMsg = msg;
+          const ta = shadow.getElementById('rrmt-dghd');
+          if (btn) { btn.textContent = msg; setTimeout(() => { btn.textContent = 'Copy DOM diagnostics'; }, 2500); }
+          render();
+        };
+
         if (navigator.clipboard && navigator.clipboard.writeText) {
-          navigator.clipboard.writeText(txt).catch(() => fbCopy(txt));
-        } else { fbCopy(txt); }
+          navigator.clipboard.writeText(txt)
+            .then(() => setMsg('\u2713 Copied to clipboard', '#5cb85c'))
+            .catch(() => setMsg('Clipboard failed \u2014 see text \u2193', '#b07070'));
+        } else {
+          setMsg('See text \u2193 to copy manually', '#8060a0');
+        }
       });
     }
 
@@ -570,7 +765,8 @@
       window.__RRMT_TEST__ = {
         VERSION, isRRPage, parseBet, parseMinBet, gameKey,
         formatAge, estimatedRemaining,
-        getPlayerName, findGamesSection, findRowContainer, extractGameIdFromEl,
+        safeClass, sanitizeHref, getPlayerName,
+        findGamesSection, findRowContainer, extractGameIdFromEl,
         parseRRLobby, processGames,
         logEvent, exportLog, captureDomDiag,
         startTracking, stopTracking, State, UI,
