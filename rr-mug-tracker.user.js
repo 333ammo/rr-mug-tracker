@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RR Mug Tracker
 // @namespace    fatboy.torn
-// @version      0.2.0
+// @version      0.2.1
 // @description  Russian Roulette lobby tracker for Torn PDA (iOS): observe active games, log events, show elapsed time.
 // @author       FATBOY [572123]
 // @match        https://www.torn.com/page.php*
@@ -10,6 +10,17 @@
 // ==/UserScript==
 
 /*
+ * RR Mug Tracker v0.2.1 — open Profile and Attack links in a new tab.
+ * No API calls, no auto-play, no attacks, no mugging.
+ *
+ * v0.2.1 changes:
+ *   - Profile and Attack anchors now include target="_blank" rel="noopener noreferrer"
+ *     so tapping either link opens the Torn page in a new tab rather than
+ *     navigating away from the RR lobby.  Uses native anchor behaviour only —
+ *     no window.open(), no JS click interception.
+ *   - Suite Q added: 4 regression tests (Q1-Q4) verifying the target and rel
+ *     attributes on both link types for a game with a valid player ID.
+ *
  * RR Mug Tracker v0.2.0 — Phase 2A: player profile and attack links.
  * No API calls, no auto-play, no attacks, no mugging.
  *
@@ -174,7 +185,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '0.2.0';
+  const VERSION = '0.2.1';
   if (window.top !== window.self) return;
 
   /* isRRPage accepts optional (pn, qs) args for test-harness use */
@@ -1128,8 +1139,8 @@
           html += '<div class="ge" id="rrmt-tm-' + esc(g.gameKey) + '">Est. remaining (\u224815 min, not guaranteed): ' + esc(formatCountdown(g.firstSeen, now)) + '</div>';
           /* Profile / Attack tap links — disabled if playerId is invalid */
           html += '<div class="gl">';
-          html += '<a' + (profURL ? ' href="' + esc(profURL) + '"' : '') + ' class="prf' + (profURL ? '' : ' dis') + '">Profile</a>';
-          html += '<a' + (atkURL  ? ' href="' + esc(atkURL)  + '"' : '') + ' class="atk' + (atkURL  ? '' : ' dis') + '">Attack</a>';
+          html += '<a' + (profURL ? ' href="' + esc(profURL) + '"' : '') + ' target="_blank" rel="noopener noreferrer" class="prf' + (profURL ? '' : ' dis') + '">Profile</a>';
+          html += '<a' + (atkURL  ? ' href="' + esc(atkURL)  + '"' : '') + ' target="_blank" rel="noopener noreferrer" class="atk' + (atkURL  ? '' : ' dis') + '">Attack</a>';
           html += '</div>';
           html += '</div>';
         }
