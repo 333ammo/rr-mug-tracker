@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RR Mug Tracker
 // @namespace    fatboy.torn
-// @version      0.1.0
+// @version      0.1.1
 // @description  Russian Roulette lobby tracker for Torn PDA (iOS): observe active games, log events, show elapsed time.
 // @author       FATBOY [572123]
 // @match        https://www.torn.com/page.php*
@@ -10,20 +10,32 @@
 // ==/UserScript==
 
 /*
- * RR Mug Tracker v0.1.0 — Phase 1: read-only lobby observer.
+ * RR Mug Tracker v0.1.1 — Phase 1: read-only lobby observer.
  * No API calls, no auto-play, no attacks, no mugging.
  *
- * DOM ASSUMPTIONS — require live Torn PDA verification:
+ * v0.1.1 fixes (live Torn PDA test):
+ *   - findRowContainer: was returning the player cell div; now returns its
+ *     parent so bet-column text is included in parseBet().
+ *   - Player name: now uses direct text nodes only to exclude nested spans
+ *     like <span>Premium data</span> that inflate the visible name.
+ *   - UI-chrome profile links (text = "View Profile" etc.) are filtered out.
+ *   - Own panel host is excluded from all DOM scans.
+ *   - Added findGamesSection() to narrow the scan scope.
+ *   - Added "Copy DOM diagnostics" button for post-test structure inspection.
+ *
+ * DOM ASSUMPTIONS — require live Torn PDA re-verification with v0.1.1:
  *   1. Player profile links: href="/profiles.php?XID=[id]"
- *   2. Each game row groups the host profile link, bet text, and a game link.
- *   3. Bet amounts appear as "$[digits,]+" within the row.
+ *   2. Each game row is a TR or a DIV that is the parent of player/bet/action
+ *      child divs.  The bet amount is in a sibling cell of the player cell.
+ *   3. Bet amounts appear as "$[digits,]+" somewhere in the row text.
  *   4. Game IDs are in link hrefs (?game=N) or data-game-id attributes.
- *   5. Player count appears as "[n]/[m] player" text within the row.
+ *   5. Player names are the direct text content of the profile link, not
+ *      text from nested child elements.
  */
 (function () {
   'use strict';
 
-  const VERSION = '0.1.0';
+  const VERSION = '0.1.1';
   if (window.top !== window.self) return;
 
   /* isRRPage accepts optional (pn, qs) args for test-harness use */
@@ -47,6 +59,9 @@
   const LOG_MAX          = 200;
   const DEFAULT_MIN_BET  = 200000000;
   const GAME_TIMEOUT_EST = 15 * 60 * 1000;
+
+  /* Profile-link texts that are UI chrome, not player names */
+  const UI_LABEL = /^(view\s+profile\.?|premium\s+data|follow|unfollow|report|trade|send\s+message|send\s+gift|bounty|add\s+to\s+friend)$/i;
 
   /* ============================ 2. STATE ============================ */
   const State = {
@@ -81,6 +96,27 @@
     return gameId ? ('g' + gameId) : ('p' + playerId);
   }
 
+  /*
+   * getPlayerName — extract the player's name from a profile link using only
+   * direct text nodes.  This intentionally excludes nested elements such as
+   * <span>Premium data</span> that Torn injects inside the anchor.
+   */
+  function getPlayerName(link) {
+    let name = '';
+    for (let i = 0; i < link.childNodes.length; i++) {
+      if (link.childNodes[i].nodeType === 3) name += link.childNodes[i].nodeValue;
+    }
+    name = name.trim();
+    if (!name) {
+      /* Fallback: full textContent minus known noise — covers edge cases */
+      name = link.textContent
+        .replace(/\bPremium\s*data\b/gi, '')
+        .replace(/\bView\s*Profile\b/gi, '')
+        .trim();
+    }
+    return name;
+  }
+
   function extractGameIdFromEl(el) {
     const links = el.querySelectorAll ? Array.from(el.querySelectorAll('a[href]')) : [];
     if (el.tagName === 'A' && el.href) links.unshift(el);
@@ -93,45 +129,139 @@
     return d ? (d.dataset && d.dataset.gameId) || null : null;
   }
 
+  /*
+   * findRowContainer — walk up from a profile link to the containing game row.
+   *
+   * v0.1.0 bug: returned the player-cell DIV itself when it had sibling DIVs,
+   * so parseBet() only saw the player column's text (no bet).
+   *
+   * v0.1.1 fix: when a DIV has >= 1 sibling DIVs it is likely a *cell*, so
+   * return its *parent* (the row) instead.  TR and LI are returned directly
+   * as before because they are already the row-level element.
+   */
   function findRowContainer(el) {
     const STOP = { LI: 1, TR: 1, ARTICLE: 1, SECTION: 1 };
     let cur = el.parentElement;
     for (let depth = 0; cur && depth < 10; depth++, cur = cur.parentElement) {
       if (STOP[cur.tagName]) return cur;
       if (cur.tagName === 'DIV' && cur.parentElement) {
-        const peers = Array.from(cur.parentElement.children)
-          .filter(c => c !== cur && c.tagName === 'DIV');
-        if (peers.length >= 1 && cur.querySelector('a[href*="/profiles.php"]')) return cur;
+        const par = cur.parentElement;
+        const peers = Array.from(par.children).filter(c => c !== cur && c.tagName === 'DIV');
+        if (peers.length >= 1) return par;
       }
     }
     return el.parentElement;
   }
 
+  /*
+   * findGamesSection — try to narrow the scan root to the "List of available
+   * games" section.  Returns null if not found; caller falls back to body.
+   * All selector queries are wrapped in try/catch for resilience.
+   */
+  function findGamesSection() {
+    try {
+      const headings = document.querySelectorAll('h1,h2,h3,h4,h5,h6,strong,b');
+      for (let i = 0; i < headings.length; i++) {
+        if (/list of available games/i.test(headings[i].textContent)) {
+          return headings[i].closest('section,article,[class*="content"],[class*="wrap"],div') ||
+                 headings[i].parentElement;
+        }
+      }
+      const sels = [
+        '[class*="available"]', '[class*="game-list"]', '[class*="gameList"]',
+        '[class*="roulette-lobby"]', '[class*="rouletteLobby"]',
+        '[id*="available"]', '[id*="game-list"]',
+      ];
+      for (let j = 0; j < sels.length; j++) {
+        const el = document.querySelector(sels[j]);
+        if (el) return el;
+      }
+    } catch (e) { /* ignore */ }
+    return null;
+  }
+
   function parseRRLobby(root) {
-    const r = root || document.body || document;
-    const links = Array.from(r.querySelectorAll('a[href*="/profiles.php?XID="]'));
+    const r = root || findGamesSection() || document.body || document;
+    const ownHost = document.getElementById(NS + '-host');
+
+    const links = Array.from(r.querySelectorAll('a[href*="/profiles.php?XID="]')).filter(a => {
+      /* Exclude links inside the tracker's own panel */
+      if (ownHost && ownHost.contains(a)) return false;
+      /* Exclude UI-chrome links by full link text */
+      if (UI_LABEL.test(a.textContent.trim())) return false;
+      return true;
+    });
+
     if (!links.length) {
       return { ok: false, reason: 'No player profile links found — lobby may not be loaded yet', games: [] };
     }
+
     const games = [], seen = new Set();
     for (const link of links) {
       const pid = (/XID=(\d+)/.exec(link.href) || [])[1];
       if (!pid) continue;
-      const row   = findRowContainer(link);
-      const gId   = row ? extractGameIdFromEl(row) : null;
-      const key   = gameKey(gId, pid);
+
+      const name = getPlayerName(link);
+      if (!name || UI_LABEL.test(name)) continue;
+
+      const row         = findRowContainer(link);
+      const gId         = row ? extractGameIdFromEl(row) : null;
+      const key         = gameKey(gId, pid);
       if (seen.has(key)) continue;
       seen.add(key);
-      const name  = link.textContent.trim() || ('Player ' + pid);
-      const bet   = row ? parseBet(row.textContent) : null;
-      const pcm   = row && /(\d+)\s*\/\s*\d+\s*player|(\d+)\s*player/i.exec(row.textContent);
+
+      const bet         = row ? parseBet(row.textContent) : null;
+      const pcm         = row && /(\d+)\s*\/\s*\d+\s*player|(\d+)\s*player/i.exec(row.textContent);
       const playerCount = pcm ? parseInt(pcm[1] || pcm[2], 10) : null;
       games.push({ key, gameId: gId, playerId: pid, playerName: name, bet, playerCount });
     }
+
     if (!games.length) {
       return { ok: false, reason: 'Profile links found but no game entries extracted — DOM structure may differ', games: [] };
     }
     return { ok: true, reason: '', games };
+  }
+
+  /*
+   * captureDomDiag — build a sanitised structural snapshot of the RR lobby
+   * DOM to help diagnose parsing issues after a live Torn PDA test.
+   * XID values are masked.  No network calls; clipboard-only.
+   */
+  function captureDomDiag() {
+    const ownHost = document.getElementById(NS + '-host');
+    const root    = findGamesSection() || document.body;
+    const allLinks = Array.from(
+      root.querySelectorAll('a[href*="/profiles.php?XID="]')
+    ).filter(a => !(ownHost && ownHost.contains(a)));
+
+    const linksInfo = allLinks.slice(0, 12).map(a => {
+      let directText = '';
+      for (let i = 0; i < a.childNodes.length; i++) {
+        if (a.childNodes[i].nodeType === 3) directText += a.childNodes[i].nodeValue;
+      }
+      const row = findRowContainer(a);
+      return {
+        fullText:   a.textContent.trim().slice(0, 60),
+        directText: directText.trim().slice(0, 60),
+        href:       (a.getAttribute('href') || '').replace(/XID=\d+/g, 'XID=X').replace(/game=\d+/g, 'game=N'),
+        parentTag:  a.parentElement ? a.parentElement.tagName : '',
+        parentCls:  (a.parentElement && typeof a.parentElement.className === 'string')
+                      ? a.parentElement.className.slice(0, 50) : '',
+        rowTag:     row ? row.tagName : '',
+        rowCls:     (row && typeof row.className === 'string') ? row.className.slice(0, 50) : '',
+        rowSnippet: row ? row.textContent.replace(/\s+/g, ' ').trim().slice(0, 100) : '',
+      };
+    });
+
+    return JSON.stringify({
+      v:               VERSION,
+      ts:              new Date().toISOString().slice(0, 19),
+      foundSection:    !!findGamesSection(),
+      rootTag:         root.tagName,
+      rootCls:         (typeof root.className === 'string') ? root.className.slice(0, 80) : '',
+      totalLinks:      allLinks.length,
+      links:           linksInfo,
+    }, null, 2);
   }
 
   /* ============================ 4. LOG ============================ */
@@ -219,6 +349,8 @@
   }
 
   function findLobbyContainer() {
+    const section = findGamesSection();
+    if (section) return section;
     const sels = [
       '[class*="roulette-lobby"]', '[class*="russianRoulette"]', '[class*="rr-lobby"]',
       '[class*="lobby"]', '[id*="roulette"]', '[id*="lobby"]', 'main', '#mainContainer',
@@ -337,6 +469,7 @@
 
       html += '<div class="cfg"><label>Min bet:&nbsp;<input id="rrmt-mb" type="text" value="' + esc(fmtBet(State.minBet)) + '" placeholder="e.g. 200M"></label></div>';
       html += '<button class="lbtn" id="rrmt-lb">Copy log (last 50)</button>';
+      html += '&nbsp;<button class="lbtn" id="rrmt-diag">Copy DOM diagnostics</button>';
       $bd.innerHTML = html;
 
       if ($tgl) $tgl.textContent = State.tracking ? '\u23F8' : '\u25B6';
@@ -349,6 +482,13 @@
       const lbEl = shadow.getElementById('rrmt-lb');
       if (lbEl) lbEl.addEventListener('click', () => {
         const txt = exportLog(50);
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(txt).catch(() => fbCopy(txt));
+        } else { fbCopy(txt); }
+      });
+      const diagEl = shadow.getElementById('rrmt-diag');
+      if (diagEl) diagEl.addEventListener('click', () => {
+        const txt = captureDomDiag();
         if (navigator.clipboard && navigator.clipboard.writeText) {
           navigator.clipboard.writeText(txt).catch(() => fbCopy(txt));
         } else { fbCopy(txt); }
@@ -428,10 +568,13 @@
     window.__RRMT__ = { version: VERSION, isAlive: UI.isAlive, destroy: UI.destroy, open: UI.open, close: UI.close };
     if (window.__RRMT_EXPOSE__ === true) {
       window.__RRMT_TEST__ = {
-        VERSION, isRRPage, parseBet, parseMinBet, gameKey, formatAge, estimatedRemaining,
-        parseRRLobby, processGames, logEvent, exportLog,
+        VERSION, isRRPage, parseBet, parseMinBet, gameKey,
+        formatAge, estimatedRemaining,
+        getPlayerName, findGamesSection, findRowContainer, extractGameIdFromEl,
+        parseRRLobby, processGames,
+        logEvent, exportLog, captureDomDiag,
         startTracking, stopTracking, State, UI,
-        findRowContainer, extractGameIdFromEl,
+        UI_LABEL,
       };
     }
   }
