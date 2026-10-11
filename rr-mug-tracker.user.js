@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RR Mug Tracker
 // @namespace    fatboy.torn
-// @version      0.3.2
+// @version      0.3.3
 // @description  Russian Roulette lobby tracker with disappearance-watch intelligence for Torn PDA (iOS) and desktop.
 // @author       FATBOY [572123]
 // @match        https://www.torn.com/page.php*
@@ -13,6 +13,26 @@
 // ==/UserScript==
 
 /*
+ * RR Mug Tracker v0.3.3 — fix Export JSON/CSV and Import JSON on Torn PDA iOS.
+ *
+ * v0.3.3 fixes:
+ *   - downloadText() returned true on iOS WKWebView even when the download was
+ *     silently blocked, so the fallback textarea was never shown.  Fix: always
+ *     show the textarea immediately; attempt download as a bonus for desktop.
+ *   - Export and Import panes appeared below the fold with no scroll; the user
+ *     saw nothing.  Fix: scroll $bd to bottom after showing export/import content.
+ *   - Every $bd.innerHTML = html reset scrollTop to 0, disrupting the user's
+ *     scroll position during routine rerenders.  Fix: save/restore scrollTop.
+ *   - Import textarea content was destroyed whenever render() fired (scan, tick).
+ *     Fix: persist typed content in State.dwImportText; restore it after innerHTML.
+ *   - No Copy All button in the export area.  Fix: added Copy All (clipboard /
+ *     select-all fallback).
+ *   - No success feedback or record count after import apply.  Fix: added
+ *     State.dwImportSuccess shown in the export/import row.
+ *   - Suite T added: 16 regression tests (T1–T16) triggering actual click handlers
+ *     and verifying resulting State and shadow DOM.
+ *   - All 142 v0.3.2 regression tests preserved.
+ *
  * RR Mug Tracker v0.3.2 — persistent disappearance history.
  *
  * v0.3.2 changes:
@@ -264,7 +284,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '0.3.2';
+  const VERSION = '0.3.3';
   if (window.top !== window.self) return;
 
   /* isRRPage accepts optional (pn, qs) args for test-harness use */
@@ -322,10 +342,12 @@
     apiKey:        '',         // user-entered API key for TM/VM (never logged)
     dwHistOpen:    false,      // disappearance watch history panel open/closed
     dwHistPage:    0,          // current history page (0-indexed)
-    dwImportOpen:  false,      // import JSON pane visible
-    dwImportError: '',         // last import error message
-    exportOutput:  null,       // fallback textarea content for export
-    exportOutputFn: '',        // filename hint for export display
+    dwImportOpen:    false,    // import JSON pane visible
+    dwImportError:   '',       // last import error message
+    dwImportText:    '',       // preserved textarea content (survives rerenders)
+    dwImportSuccess: '',       // success message after apply
+    exportOutput:    null,     // export textarea content (always shown on mobile)
+    exportOutputFn:  '',       // filename hint for export display
   };
 
   /* ============================ 3. PARSING ============================ */
@@ -2159,9 +2181,12 @@
       html += '<div class="dw-exp-row">';
       html += '<button class="lbtn" id="rrmt-dw-exp-json">Export JSON</button>';
       html += '<button class="lbtn" id="rrmt-dw-exp-csv">Export CSV</button>';
-      html += '<button class="lbtn" id="rrmt-dw-imp-tgl">' + (State.dwImportOpen ? 'Cancel Import' : 'Import JSON') + '</button>';
+      html += '<button class="lbtn" id="rrmt-dw-imp-tgl">' + (State.dwImportOpen ? 'Cancel' : 'Import JSON') + '</button>';
       if (PersistenceStore.isAvailable()) {
         html += '<span style="font-size:9px;color:#5a8060;margin-left:2px">\u2713&nbsp;saved</span>';
+      }
+      if (State.dwImportSuccess) {
+        html += '<span style="font-size:9px;color:#5cb85c;margin-left:2px">' + esc(State.dwImportSuccess) + '</span>';
       }
       html += '</div>';
 
@@ -2180,12 +2205,15 @@
 
       html += '</div>'; /* /dws */
 
-      /* Export output fallback — shown when download failed (e.g. Torn PDA) */
+      /* Export output — always shown after export (mobile-safe: no download dependency) */
       if (State.exportOutput) {
         html += '<div class="dg-wrap">';
         html += '<div class="dg-hd"><span>\uD83D\uDCE4 ' + esc(State.exportOutputFn || 'Export') + '</span>';
-        html += '<button class="lbtn" id="rrmt-exp-clr">\u2715 Clear</button></div>';
-        html += '<div class="dg-hint">Select all \u2192 copy, or long-press to share</div>';
+        html += '<div style="display:flex;gap:4px">';
+        html += '<button class="lbtn" id="rrmt-exp-copy">Copy All</button>';
+        html += '<button class="lbtn" id="rrmt-exp-clr">\u2715 Clear</button>';
+        html += '</div></div>';
+        html += '<div class="dg-hint">Tap Copy All, or select all text below and copy</div>';
         html += '<textarea class="dg-ta" id="rrmt-exp-ta" readonly></textarea>';
         html += '</div>';
       }
@@ -2207,11 +2235,13 @@
         html += '</div>';
       }
 
+      var _savedScroll = $bd.scrollTop;
       $bd.innerHTML = html;
+      $bd.scrollTop = _savedScroll;  /* preserve scroll position across rerenders */
 
       if ($tgl) $tgl.textContent = State.tracking ? '\u23F8' : '\u25B6';
 
-      /* set textarea value after innerHTML (avoids HTML-escaping the JSON) */
+      /* set textarea values and wire listeners after innerHTML */
       if (State.diagOutput) {
         const ta = shadow.getElementById('rrmt-dgta');
         if (ta) ta.value = State.diagOutput;
@@ -2223,14 +2253,39 @@
         });
       }
 
-      /* Export output fallback textarea */
+      /* Export output textarea — set value and wire Copy All / Clear */
       if (State.exportOutput) {
         const expTa = shadow.getElementById('rrmt-exp-ta');
         if (expTa) expTa.value = State.exportOutput;
+
+        const expCopyEl = shadow.getElementById('rrmt-exp-copy');
+        if (expCopyEl) expCopyEl.addEventListener('click', function () {
+          var ta  = shadow.getElementById('rrmt-exp-ta');
+          var btn = this;
+          if (!ta) return;
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(ta.value).then(function () {
+              btn.textContent = '\u2713 Copied';
+              setTimeout(function () { btn.textContent = 'Copy All'; }, 2000);
+            }).catch(function () { ta.setSelectionRange(0, ta.value.length); ta.focus(); });
+          } else {
+            ta.setSelectionRange(0, ta.value.length); ta.focus();
+          }
+        });
+
         const expClr = shadow.getElementById('rrmt-exp-clr');
         if (expClr) expClr.addEventListener('click', function () {
           State.exportOutput = null; State.exportOutputFn = ''; render();
         });
+      }
+
+      /* Import textarea — restore preserved content and wire input handler */
+      if (State.dwImportOpen) {
+        var impTaEl = shadow.getElementById('rrmt-dw-imp-ta');
+        if (impTaEl) {
+          if (State.dwImportText) impTaEl.value = State.dwImportText;
+          impTaEl.addEventListener('input', function () { State.dwImportText = this.value; });
+        }
       }
 
       /* Disappearance Watch event listeners */
@@ -2270,15 +2325,15 @@
         State.dwHistPage++; render();
       });
 
+      /* Export: always show textarea (mobile-safe); also attempt download on desktop */
       function _doExport(text, fname, mime) {
-        var downloaded = downloadText(fname, mime, text);
-        if (!downloaded) {
-          State.exportOutput   = text;
-          State.exportOutputFn = fname;
-          render();
-          var ta = shadow.getElementById('rrmt-exp-ta');
-          if (ta) ta.value = text;
-        }
+        State.exportOutput   = text;
+        State.exportOutputFn = fname;
+        downloadText(fname, mime, text);  /* desktop bonus; silently ignored on iOS */
+        render();
+        $bd.scrollTop = $bd.scrollHeight; /* scroll to reveal export textarea */
+        var ta = shadow.getElementById('rrmt-exp-ta');
+        if (ta) ta.value = text;
       }
       const expJsonEl = shadow.getElementById('rrmt-dw-exp-json');
       if (expJsonEl) expJsonEl.addEventListener('click', function () {
@@ -2292,19 +2347,25 @@
       });
       const impTglEl = shadow.getElementById('rrmt-dw-imp-tgl');
       if (impTglEl) impTglEl.addEventListener('click', function () {
-        State.dwImportOpen  = !State.dwImportOpen;
-        State.dwImportError = '';
+        State.dwImportOpen    = !State.dwImportOpen;
+        State.dwImportError   = '';
+        State.dwImportSuccess = '';
         render();
+        if (State.dwImportOpen) $bd.scrollTop = $bd.scrollHeight; /* reveal import pane */
       });
       const impApplyEl = shadow.getElementById('rrmt-dw-imp-apply');
       if (impApplyEl) impApplyEl.addEventListener('click', function () {
+        /* Read from live textarea; fall back to State-preserved copy */
         var ta   = shadow.getElementById('rrmt-dw-imp-ta');
-        var text = ta ? ta.value.trim() : '';
+        var text = (ta ? ta.value : State.dwImportText || '').trim();
         if (!text) { State.dwImportError = 'No data to import'; render(); return; }
         var result = importHistoryJSON(text);
         if (result.ok) {
-          State.dwImportOpen  = false;
-          State.dwImportError = '';
+          State.dwImportOpen    = false;
+          State.dwImportError   = '';
+          State.dwImportText    = '';
+          State.dwImportSuccess = 'Imported\u00a0' + result.added +
+                                  '\u00a0new\u00a0record' + (result.added !== 1 ? 's' : '');
           PersistenceStore.save(Date.now());
           DisappearanceEngine.clearDirty();
         } else {
