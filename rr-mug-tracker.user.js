@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RR Mug Tracker
 // @namespace    fatboy.torn
-// @version      0.3.3
+// @version      0.3.4
 // @description  Russian Roulette lobby tracker with disappearance-watch intelligence for Torn PDA (iOS) and desktop.
 // @author       FATBOY [572123]
 // @match        https://www.torn.com/page.php*
@@ -13,6 +13,22 @@
 // ==/UserScript==
 
 /*
+ * RR Mug Tracker v0.3.4 — Disappearance Watch minimum bet display filter.
+ *
+ * v0.3.4 changes:
+ *   - New "Min Watch Bet" setting inside Disappearance Watch (default $50M).
+ *     Display-only filter: hides low-bet cards from the watch panel without
+ *     touching tracking, history, exports or status-check scheduling.
+ *   - Games with unknown/null bet are always shown regardless of the filter.
+ *   - Setting 0 shows all games (filter disabled).
+ *   - Counter "Showing X of Y disappeared games" shown whenever candidates exist.
+ *   - "No disappeared games above your minimum bet." empty state when all filtered.
+ *   - Preference persisted via PersistenceStore.savePref/loadPref using a
+ *     separate key ("rrmt_dw_pref") — DE_STORE_KEY schema is unchanged.
+ *   - Input uses change event (on blur/enter) — no frequent rerenders while typing.
+ *   - Suite V added: 15 regression tests (V1–V15).
+ *   - All 158 v0.3.3 regression tests preserved.
+ *
  * RR Mug Tracker v0.3.3 — fix Export JSON/CSV and Import JSON on Torn PDA iOS.
  *
  * v0.3.3 fixes:
@@ -284,7 +300,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '0.3.3';
+  const VERSION = '0.3.4';
   if (window.top !== window.self) return;
 
   /* isRRPage accepts optional (pn, qs) args for test-harness use */
@@ -324,6 +340,8 @@
   const DE_STORE_KEY            = 'rrmt_de_store';
   const DE_STORE_VERSION        = 1;
   const DE_SAVE_THROTTLE_MS     = 5000;
+  const DW_PREF_KEY             = 'rrmt_dw_pref';  /* separate key — never mixed with DE_STORE_KEY */
+  const DEFAULT_DW_MIN_BET      = 50000000;         /* 50M default watch display filter */
 
   /* Profile-link texts that are UI chrome, not player names */
   const UI_LABEL = /^(view\s+profile\.?|premium\s+data|follow|unfollow|report|trade|send\s+message|send\s+gift|bounty|add\s+to\s+friend)$/i;
@@ -348,6 +366,7 @@
     dwImportSuccess: '',       // success message after apply
     exportOutput:    null,     // export textarea content (always shown on mobile)
     exportOutputFn:  '',       // filename hint for export display
+    dwWatchMin:      DEFAULT_DW_MIN_BET,  // watch-panel display filter (0 = show all)
   };
 
   /* ============================ 3. PARSING ============================ */
@@ -1721,7 +1740,10 @@
     function isAvailable() { return _available; }
     function _forceNow(ts) { _lastSave = 0; _doSave(ts || Date.now()); } /* test-only: bypass throttle */
 
-    return { probe, save, load, isAvailable, _forceNow };
+    function savePref(key, val) { if (!_probed) probe(); _gmSet(key, val); }
+    function loadPref(key, def) { if (!_probed) probe(); return _gmGet(key, def); }
+
+    return { probe, save, load, isAvailable, _forceNow, savePref, loadPref };
   })();
 
   /* ============================ 10. STATUS CHECKER ============================ */
@@ -1982,6 +2004,8 @@
       '.dw-cfg label{display:flex;align-items:center;gap:4px;cursor:pointer}',
       '.dw-cfg input[type=checkbox]{width:13px;height:13px;accent-color:#8040c0;cursor:pointer}',
       '.dw-cfg input[type=password]{max-width:130px;padding:3px 6px;border-radius:4px;border:1px solid #3a1a5a;background:#080410;color:#ddd0f0;font:10px inherit}',
+      '.dw-cfg input[type=text]{width:60px;padding:3px 6px;border-radius:4px;border:1px solid #3a1a5a;background:#080410;color:#ddd0f0;font:10px inherit}',
+      '.dw-cnt{font-size:10px;color:#3a2050;padding:4px 0 2px;text-align:right}',
       '.dw-hist{margin-top:4px;padding-top:4px;border-top:1px solid #1e1030;font-size:10px;color:#5a4070}',
       '.dw-hist-item{padding:2px 0;display:flex;gap:5px;align-items:baseline;flex-wrap:wrap}',
       '.dw-hist-nm{color:#6a5070}',
@@ -2064,8 +2088,11 @@
       }
 
       /* ── Disappearance Watch ── */
-      var dwCands = DisappearanceEngine.getCandidates();
-      var dwHist  = DisappearanceEngine.getHistory();
+      var dwCands    = DisappearanceEngine.getCandidates();
+      var dwHist     = DisappearanceEngine.getHistory();
+      var dwFiltered = State.dwWatchMin > 0
+        ? dwCands.filter(function (c) { return c.bet == null || c.bet >= State.dwWatchMin; })
+        : dwCands;
       html += '<div class="dws">';
       html += '<div class="dwsh">\uD83D\uDC41 Disappearance Watch';
       if (dwCands.length) html += '<span class="dwsc">' + dwCands.length + '</span>';
@@ -2073,9 +2100,13 @@
 
       if (!dwCands.length) {
         html += '<div class="dw-empty">No confirmed disappearances yet</div>';
+      } else if (!dwFiltered.length) {
+        html += '<div class="dw-cnt">Showing 0 of ' + dwCands.length + ' disappeared game' + (dwCands.length !== 1 ? 's' : '') + '</div>';
+        html += '<div class="dw-empty">No disappeared games above your minimum bet.</div>';
       } else {
-        for (var di = 0; di < dwCands.length; di++) {
-          var dc = dwCands[di];
+        html += '<div class="dw-cnt">Showing ' + dwFiltered.length + ' of ' + dwCands.length + ' disappeared game' + (dwCands.length !== 1 ? 's' : '') + '</div>';
+        for (var di = 0; di < dwFiltered.length; di++) {
+          var dc = dwFiltered[di];
           var isAct = dc.priority >= 60;
           var isSup = dc.state === 'HOSPITAL';
           html += '<div class="dwc' + (isSup ? ' sup' : isAct ? ' act' : '') + '">';
@@ -2134,7 +2165,7 @@
         }
       }
 
-      /* Status check config */
+      /* Status check config + Min Watch Bet */
       html += '<div class="dw-cfg">';
       html += '<label><input type="checkbox" id="rrmt-sc-on"' +
               (State.statusEnabled ? ' checked' : '') + '>&nbsp;Status checks</label>';
@@ -2145,6 +2176,10 @@
       } else if (State.statusEnabled && pdaKeyLive) {
         html += '<span style="color:#5cb85c;font-size:9px">\u2713 PDA key active</span>';
       }
+      html += '<label style="margin-left:6px;flex-shrink:0">Min Watch Bet:&nbsp;' +
+              '<input id="rrmt-dw-mb" type="text" size="6" value="' +
+              esc(fmtBet(State.dwWatchMin)) + '" placeholder="e.g.\u202F50M">' +
+              '</label>';
       html += '</div>';
 
       /* History — paginated, accurate count */
@@ -2380,6 +2415,16 @@
         if (v && v > 0) { State.minBet = v; render(); }
       });
 
+      const dwMbEl = shadow.getElementById('rrmt-dw-mb');
+      if (dwMbEl) dwMbEl.addEventListener('change', function () {
+        var v = parseMinBet(this.value);
+        if (v !== null) {
+          State.dwWatchMin = v;
+          PersistenceStore.savePref(DW_PREF_KEY, v);
+          render();
+        }
+      });
+
       const lbEl = shadow.getElementById('rrmt-lb');
       if (lbEl) lbEl.addEventListener('click', () => {
         const txt = exportLog(50);
@@ -2496,6 +2541,8 @@
     if (!document.body) { document.addEventListener('DOMContentLoaded', boot, { once: true }); return; }
     PersistenceStore.probe();
     PersistenceStore.load();
+    var _dwPref = PersistenceStore.loadPref(DW_PREF_KEY, DEFAULT_DW_MIN_BET);
+    if (typeof _dwPref === 'number' && _dwPref >= 0) State.dwWatchMin = _dwPref;
     UI.build();
     window.__RRMT__ = { version: VERSION, isAlive: UI.isAlive, destroy: UI.destroy, open: UI.open, close: UI.close };
     if (window.__RRMT_EXPOSE__ === true) {
@@ -2514,6 +2561,7 @@
         DisappearanceEngine, StatusChecker,
         PersistenceStore,
         DE_HISTORY_MAX, DE_STORE_VERSION,
+        DW_PREF_KEY, DEFAULT_DW_MIN_BET,
         exportHistoryJSON, exportHistoryCSV, importHistoryJSON,
       };
     }
