@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RR Mug Tracker
 // @namespace    fatboy.torn
-// @version      0.1.6
+// @version      0.1.7
 // @description  Russian Roulette lobby tracker for Torn PDA (iOS): observe active games, log events, show elapsed time.
 // @author       FATBOY [572123]
 // @match        https://www.torn.com/page.php*
@@ -10,6 +10,23 @@
 // ==/UserScript==
 
 /*
+ * RR Mug Tracker v0.1.7 — fix inline timer position and bet parsing corruption.
+ * No API calls, no auto-play, no attacks, no mugging.
+ *
+ * v0.1.7 changes:
+ *   - injectLobbyTimers() now targets [class*="statusBlock"] inside each game
+ *     row rather than appending to the row element itself.  Appending to the row
+ *     placed the countdown outside the visible table columns (confirmed iOS bug).
+ *     Rows where no statusBlock cell is found are skipped — no fallback append.
+ *   - parseRRLobby() bet extraction now prefers a dedicated bet cell
+ *     ([class*="betBlock"], [class*="betAmount"], [class*="betWrap"]) over
+ *     row.textContent.  If no cell is found, the fallback strips all
+ *     [data-rrmt-timer] spans from a row clone before parsing.
+ *     Root cause: injected timer text (e.g. "14:54") was concatenated into
+ *     row.textContent, corrupting parseBet output (live: $10 read as $1,014).
+ *   - Player-count regex now also runs on timer-stripped row text.
+ *   - Suite M added: 9 regression tests for bet isolation and timer placement.
+ *
  * RR Mug Tracker v0.1.5 — fix player name extraction.
  * No API calls, no auto-play, no attacks, no mugging.
  *
@@ -108,7 +125,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '0.1.6';
+  const VERSION = '0.1.7';
   if (window.top !== window.self) return;
 
   /* isRRPage accepts optional (pn, qs) args for test-harness use */
@@ -321,7 +338,7 @@
    * Game ID : row.id (numeric)  →  button[data-id]  →  link-href ?game=N.
    * Player  : a[href*="/profiles.php?XID="] inside the row.
    * Name    : direct text nodes of profile link (getPlayerName) → honorWrap fallback.
-   * Bet     : parseBet(row.textContent) — scoped per row, no cross-row leakage.
+   * Bet     : [class*="betBlock"] cell text (preferred) → timer-stripped row text.
    */
   function parseRRLobby(root) {
     const section = root || findGamesSection();
@@ -380,9 +397,26 @@
       if (seen.has(key)) continue;
       seen.add(key);
 
-      /* Bet and player count: scoped to this row's textContent only */
-      const bet         = parseBet(row.textContent);
-      const pcm         = /(\d+)\s*\/\s*\d+\s*player|(\d+)\s*player/i.exec(row.textContent);
+      /* Row text with injected timer spans removed (avoids "14:54" polluting numbers) */
+      const timerEls = row.querySelectorAll('[data-rrmt-timer]');
+      const rowText  = timerEls.length ? (function () {
+        const c = row.cloneNode(true);
+        Array.from(c.querySelectorAll('[data-rrmt-timer]')).forEach(function (s) {
+          if (s.parentNode) s.parentNode.removeChild(s);
+        });
+        return c.textContent;
+      }()) : row.textContent;
+
+      /* Bet: prefer dedicated bet cell — immune to timer injection in any cell */
+      let betText = null;
+      try {
+        const betCell = row.querySelector('[class*="betBlock"]') ||
+                        row.querySelector('[class*="betAmount"]') ||
+                        row.querySelector('[class*="betWrap"]');
+        if (betCell) betText = betCell.textContent;
+      } catch (e) { /* skip */ }
+      const bet         = parseBet(betText != null ? betText : rowText);
+      const pcm         = /(\d+)\s*\/\s*\d+\s*player|(\d+)\s*player/i.exec(rowText);
       const playerCount = pcm ? parseInt(pcm[1] || pcm[2], 10) : null;
       games.push({ key, gameId: gId, playerId: pid, playerName: name, bet, playerCount });
     }
@@ -793,34 +827,37 @@
     UI.render();
   }
 
-  /* injectLobbyTimers — add a countdown span to each tracked game row in the
-     live Torn DOM.  Only one span per row; survivors of React rerenders are
-     updated in place by updateLobbyTimers().  Rows without a matching State
-     entry (unknown firstSeen) receive "Age unknown" text. */
+  /* injectLobbyTimers — inject countdown inside each game row's status cell.
+     Targets [class*="statusBlock"] so the timer stays inside the correct column.
+     Rows that have no statusBlock are skipped — the tracker never appends outside
+     the row's column structure.  Idempotent: if a statusBlock already contains
+     our span (row.querySelector finds it), the row is skipped.  React rerenders
+     that clear the statusBlock innerHTML will be re-injected on the next tick. */
   function injectLobbyTimers() {
     try {
       const section = findGamesSection();
       if (!section) return;
       const rowsWrap = findRowsWrap(section);
       if (!rowsWrap) return;
+      const ownHost = document.getElementById(NS + '-host');
       const now = Date.now();
       Array.from(rowsWrap.children).forEach(function (row) {
         if (!row.id || !/^\d+$/.test(row.id)) return;
+        if (ownHost && ownHost.contains(row)) return;
+        /* Skip if our span is already present anywhere in the row */
+        if (row.querySelector('[data-rrmt-timer]')) return;
+        /* Inject only into the status cell — skip if not found */
+        let statusCell = null;
+        try { statusCell = row.querySelector('[class*="statusBlock"]'); } catch (e) { /* skip */ }
+        if (!statusCell) return;
         const gId = row.id;
-        /* Find the matching State entry by gameId */
         let entry = null;
         State.games.forEach(function (e) { if (e.gameId === gId) entry = e; });
-        /* Skip if already has our timer span */
-        if (row.querySelector('[data-rrmt-timer]')) {
-          return;
-        }
-        /* Find "Waiting..." or status text node — inject after it */
         const span = document.createElement('span');
         span.setAttribute('data-rrmt-timer', gId);
-        span.style.cssText = 'margin-left:6px;font-size:10px;color:#8060b0;font-style:italic';
+        span.style.cssText = 'display:block;font-size:10px;color:#8060b0;font-style:italic';
         span.textContent = entry ? formatCountdown(entry.firstSeen, now) : 'Age unknown';
-        /* Append to the row — after any existing text */
-        row.appendChild(span);
+        statusCell.appendChild(span);
       });
     } catch (e) { /* defensive — never crash the tracker */ }
   }
