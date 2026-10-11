@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RR Mug Tracker
 // @namespace    fatboy.torn
-// @version      0.3.0
+// @version      0.3.1
 // @description  Russian Roulette lobby tracker with disappearance-watch intelligence for Torn PDA (iOS) and desktop.
 // @author       FATBOY [572123]
 // @match        https://www.torn.com/page.php*
@@ -11,7 +11,23 @@
 // ==/UserScript==
 
 /*
- * RR Mug Tracker v0.3.0 — Phase 2B: Disappearance Intelligence Engine.
+ * RR Mug Tracker v0.3.1 — correctness hotfix for Phase 2B.
+ *
+ * v0.3.1 fixes:
+ *   - R11 test: snapshot state string value before resume() mutates the object.
+ *   - PDA_httpGet: switched to Promise-based API (PDA-native preferred over GM).
+ *   - StatusChecker.tick: fills slot by direct reference; calls _updateStatusResult
+ *     instead of observePlayerStatus, eliminating proximity-based slot misassignment.
+ *   - _parseResp: captures apiTs from json.timestamp * 1000; passes as third callback arg.
+ *   - _updateStatusResult: added isLatest guard so older Hospital cannot suppress a
+ *     more recent Okay (out-of-order response protection).
+ *   - CANDIDATE→CONFIRMED: requires (timestamp − candidateTs) ≥ DE_CONFIRM_DEBOUNCE_MS
+ *     (800 ms) to prevent rapid MutationObserver callbacks from confirming too quickly.
+ *   - _computePriority: filters slots and ok15 check where apiTs < confirmedTs (stale
+ *     pre-disappearance cached API data must not contribute to priority score).
+ *   - Suite R extended: R21 (out-of-order Hospital), R22 (debounce), R23 (no +15s bonus).
+ *
+ * v0.3.0 — Phase 2B: Disappearance Intelligence Engine.
  * No auto-play, no attacks, no mugging, no automatic actions.
  *
  * v0.3.0 changes:
@@ -223,7 +239,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '0.3.0';
+  const VERSION = '0.3.1';
   if (window.top !== window.self) return;
 
   /* isRRPage accepts optional (pn, qs) args for test-harness use */
@@ -255,9 +271,10 @@
   const DE_DECAY_FLOOR    = 5;
   const DE_STATUS_OFFSETS = [0, 15000, 30000, 45000, 60000, 90000];
   const DE_HISTORY_MAX    = 50;
-  const DE_RATE_MS        = 2500;   /* max ~24 status requests / min */
-  const DE_TIMEOUT_MS     = 10000;
-  const DE_PDA_KEY        = '###PDA-APIKEY###';  /* PDA replaces at install time */
+  const DE_RATE_MS              = 2500;   /* max ~24 status requests / min */
+  const DE_TIMEOUT_MS           = 10000;
+  const DE_PDA_KEY              = '###PDA-APIKEY###';  /* PDA replaces at install time */
+  const DE_CONFIRM_DEBOUNCE_MS  = 800;    /* min ms between CANDIDATE and CONFIRMED */
 
   /* Profile-link texts that are UI chrome, not player names */
   const UI_LABEL = /^(view\s+profile\.?|premium\s+data|follow|unfollow|report|trade|send\s+message|send\s+gift|bounty|add\s+to\s+friend)$/i;
@@ -1141,7 +1158,7 @@
         candidateTs:   null,
         confirmedTs:   null,
         statusChecks:  DE_STATUS_OFFSETS.map(function (o) {
-          return { offset: o, scheduledAt: null, result: null, error: null, ts: null };
+          return { offset: o, scheduledAt: null, result: null, error: null, ts: null, apiTs: null };
         }),
         latestStatus:  null,
         latestStatusTs:null,
@@ -1162,9 +1179,19 @@
       if (!entry.confirmedTs)         return { score: 0, reason: '' };
 
       const base   = (entry.firstSeen === null) ? 35 : 50;
-      const checks = entry.statusChecks.filter(function (c) { return c.result && c.result !== 'ERROR'; });
+      /* Filter out ERROR slots and stale results (API data predates disappearance) */
+      const checks = entry.statusChecks.filter(function (c) {
+        if (!c.result || c.result === 'ERROR') return false;
+        if (c.apiTs !== null && typeof c.apiTs === 'number' && c.apiTs < entry.confirmedTs) return false;
+        return true;
+      });
       const okays  = checks.filter(function (c) { return c.result === 'Okay'; });
-      const ok15   = entry.statusChecks.find(function (c) { return c.offset === 15000 && c.result === 'Okay'; });
+      /* +15s bonus only if that specific slot carries a fresh Okay */
+      const ok15   = entry.statusChecks.find(function (c) {
+        if (c.offset !== 15000 || c.result !== 'Okay') return false;
+        if (c.apiTs !== null && typeof c.apiTs === 'number' && c.apiTs < entry.confirmedTs) return false;
+        return true;
+      });
 
       let bonus = 0;
       var reasons = [];
@@ -1259,13 +1286,18 @@
           entry.stateReason = 'Absent from 1 valid scan — awaiting confirmation';
           entry.candidateTs = timestamp;
         } else if (abs >= 2 && entry.state === 'CANDIDATE') {
-          entry.state       = 'CONFIRMED';
-          entry.stateReason = 'Confirmed absent across ' + abs + ' valid scans';
-          entry.confirmedTs = timestamp;
-          _scheduleChecks(entry, timestamp);
-          var pr = _computePriority(entry, timestamp);
-          entry.priority       = pr.score;
-          entry.priorityReason = pr.reason;
+          /* Require a real debounce interval — prevents rapid MutationObserver callbacks
+             from confirming a game that may be in the middle of a React rerender */
+          if (entry.candidateTs !== null &&
+              (timestamp - entry.candidateTs) >= DE_CONFIRM_DEBOUNCE_MS) {
+            entry.state       = 'CONFIRMED';
+            entry.stateReason = 'Confirmed absent across ' + abs + ' valid scans';
+            entry.confirmedTs = timestamp;
+            _scheduleChecks(entry, timestamp);
+            var pr = _computePriority(entry, timestamp);
+            entry.priority       = pr.score;
+            entry.priorityReason = pr.reason;
+          }
         }
       });
 
@@ -1297,14 +1329,15 @@
         }
         if (bestSlot) { bestSlot.result = status; bestSlot.ts = timestamp; }
 
-        /* Always track latest */
-        if (entry.latestStatusTs === null || timestamp >= entry.latestStatusTs) {
+        /* Track latest by timestamp — older out-of-order results must not overwrite newer */
+        var isLatest = (entry.latestStatusTs === null || timestamp >= entry.latestStatusTs);
+        if (isLatest) {
           entry.latestStatus   = status;
           entry.latestStatusTs = timestamp;
         }
 
-        /* Hospital suppression */
-        if (status === 'Hospital') {
+        /* Hospital suppression — only if this is the latest evidence */
+        if (status === 'Hospital' && isLatest) {
           entry.state       = 'HOSPITAL';
           entry.stateReason = 'Host in hospital — not actionable';
         }
@@ -1394,6 +1427,27 @@
       _archiveIfDone(entry);
     }
 
+    /* Production path: called by StatusChecker after it fills the slot directly.
+       Does NOT do proximity slot-matching — the slot was already filled by reference.
+       Updates latestStatus, handles hospital suppression, recomputes priority. */
+    function _updateStatusResult(gameId, status, ts, apiTs) {
+      var entry = _watches.get(gameId);
+      if (!entry) return;
+      if (entry.state !== 'CONFIRMED' && entry.state !== 'HOSPITAL') return;
+      var isLatest = (entry.latestStatusTs === null || ts >= entry.latestStatusTs);
+      if (isLatest) {
+        entry.latestStatus   = status;
+        entry.latestStatusTs = ts;
+      }
+      if (status === 'Hospital' && isLatest) {
+        entry.state       = 'HOSPITAL';
+        entry.stateReason = 'Host in hospital — not actionable';
+      }
+      var pr = _computePriority(entry, ts);
+      entry.priority       = pr.score;
+      entry.priorityReason = pr.reason;
+    }
+
     function _getWatches() { return _watches; } /* test-only */
     function _reset() {                          /* test-only */
       _watches.clear(); _history = []; _absCount.clear(); _suspended = false;
@@ -1402,7 +1456,7 @@
     return {
       observeSnapshot, observePlayerStatus, tick, getDueChecks,
       getCandidates, getHistory, resetOrSuspend, resume,
-      setOutcome, dismiss, _getWatches, _reset,
+      setOutcome, dismiss, _updateStatusResult, _getWatches, _reset,
     };
   })();
 
@@ -1436,17 +1490,37 @@
           (json.basic   && json.basic.status   && json.basic.status.state)   ||
           (json.status  && json.status.state)   ||
           null;
+        var apiTs = (json.timestamp && typeof json.timestamp === 'number')
+                    ? json.timestamp * 1000 : null;
         if (!state) {
           var apiErr = json.error ? (json.error.error || String(json.error)) : 'No state in response';
           cb(null, apiErr); return;
         }
-        cb(state, null);
+        cb(state, null, apiTs);
       } catch (e) { cb(null, 'Parse error'); }
     }
 
     function _doFetch(playerId, key, cb) {
       var url = 'https://api.torn.com/v2/user/' + encodeURIComponent(playerId) +
                 '/basic?key=' + encodeURIComponent(key);
+      if (typeof PDA_httpGet === 'function') {
+        try {
+          var p = PDA_httpGet(url);
+          if (p && typeof p.then === 'function') {
+            p.then(function (resp) {
+              if (resp == null) { cb(null, 'No response'); return; }
+              if (typeof resp === 'string') {
+                _parseResp(resp, cb);
+              } else {
+                var code = resp.status != null ? Number(resp.status) : 200;
+                if (code !== 200) { cb(null, 'HTTP ' + code); return; }
+                _parseResp(resp.responseText || resp.body || resp.data || '', cb);
+              }
+            }).catch(function (e) { cb(null, e ? String(e) : 'PDA error'); });
+            return;
+          }
+        } catch (e) { /* fall through */ }
+      }
       if (typeof GM_xmlhttpRequest === 'function') {
         GM_xmlhttpRequest({
           method: 'GET', url: url, timeout: DE_TIMEOUT_MS,
@@ -1457,25 +1531,18 @@
           onerror:   function () { cb(null, 'Network error'); },
           ontimeout: function () { cb(null, 'Timeout'); },
         });
-      } else if (typeof PDA_httpGet === 'function') {
-        try {
-          PDA_httpGet(url, function (data, status) {
-            if (status !== 200) { cb(null, 'HTTP ' + status); return; }
-            _parseResp(data, cb);
-          });
-        } catch (e) { cb(null, 'PDA_httpGet error'); }
-      } else {
-        var ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
-        var tid  = ctrl ? setTimeout(function () { ctrl.abort(); }, DE_TIMEOUT_MS) : null;
-        fetch(url, ctrl ? { signal: ctrl.signal } : {})
-          .then(function (r) {
-            clearTimeout(tid);
-            if (!r.ok) { cb(null, 'HTTP ' + r.status); return Promise.reject(null); }
-            return r.text();
-          })
-          .then(function (t) { _parseResp(t, cb); })
-          .catch(function (e) { if (e) { clearTimeout(tid); cb(null, 'Fetch error'); } });
+        return;
       }
+      var ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      var tid  = ctrl ? setTimeout(function () { ctrl.abort(); }, DE_TIMEOUT_MS) : null;
+      fetch(url, ctrl ? { signal: ctrl.signal } : {})
+        .then(function (r) {
+          clearTimeout(tid);
+          if (!r.ok) { cb(null, 'HTTP ' + r.status); return Promise.reject(null); }
+          return r.text();
+        })
+        .then(function (t) { _parseResp(t, cb); })
+        .catch(function (e) { if (e) { clearTimeout(tid); cb(null, 'Fetch error'); } });
     }
 
     function tick(now) {
@@ -1492,11 +1559,14 @@
       _inFlight = true;
       _lastAt   = now;
 
-      _doFetch(item.playerId, key, function (status, err) {
+      _doFetch(item.playerId, key, function (status, err, apiTs) {
         _inFlight = false;
         var ts = Date.now();
         if (status) {
-          DisappearanceEngine.observePlayerStatus(item.playerId, status, ts);
+          item.slot.result = status;
+          item.slot.ts     = ts;
+          item.slot.apiTs  = apiTs || null;
+          DisappearanceEngine._updateStatusResult(item.gameId, status, ts, apiTs);
         } else {
           /* Mark slot errored so it is not re-queued */
           item.slot.result = 'ERROR';
