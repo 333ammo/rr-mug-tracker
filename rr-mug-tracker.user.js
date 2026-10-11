@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RR Mug Tracker
 // @namespace    fatboy.torn
-// @version      0.1.5
+// @version      0.1.6
 // @description  Russian Roulette lobby tracker for Torn PDA (iOS): observe active games, log events, show elapsed time.
 // @author       FATBOY [572123]
 // @match        https://www.torn.com/page.php*
@@ -108,7 +108,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '0.1.5';
+  const VERSION = '0.1.6';
   if (window.top !== window.self) return;
 
   /* isRRPage accepts optional (pn, qs) args for test-harness use */
@@ -686,6 +686,16 @@
     return Math.max(0, GAME_TIMEOUT_EST - ((now != null ? now : Date.now()) - firstSeen));
   }
 
+  function formatCountdown(firstSeen, now) {
+    if (firstSeen == null) return 'Age unknown';
+    const rem = GAME_TIMEOUT_EST - ((now != null ? now : Date.now()) - firstSeen);
+    if (rem <= 0) return 'Estimate reached';
+    const totalSec = Math.floor(rem / 1000);
+    const m = Math.floor(totalSec / 60);
+    const s = totalSec % 60;
+    return m + ':' + (s < 10 ? '0' + s : '' + s);
+  }
+
   /* ============================ 6. GAME PROCESSING ============================ */
   function processGames(games, isInitial, now) {
     const currentKeys = new Set(games.map(g => g.key));
@@ -723,11 +733,12 @@
     State.parseNote = result.reason;
     if (!result.ok) { UI.render(); return; }
     processGames(result.games, isInitial, Date.now());
+    injectLobbyTimers();
     UI.render();
   }
 
   /* ============================ 7. OBSERVER ============================ */
-  let _observer = null, _throttleTimer = null, _renderTimer = null;
+  let _observer = null, _throttleTimer = null, _renderTimer = null, _tickTimer = null;
 
   function scheduleScan() {
     if (_throttleTimer) return;
@@ -755,9 +766,19 @@
     State.tracking = true;
     logEvent('TRACKING_RESUMED');
     scanLobby(true);
-    _observer = new MutationObserver(scheduleScan);
+    _observer = new MutationObserver(function (mutations) {
+      for (let i = 0; i < mutations.length; i++) {
+        const tgt = mutations[i].target;
+        if (tgt && tgt.hasAttribute && tgt.hasAttribute('data-rrmt-timer')) continue;
+        if (tgt && tgt.parentElement && tgt.parentElement.hasAttribute &&
+            tgt.parentElement.hasAttribute('data-rrmt-timer')) continue;
+        scheduleScan();
+        return;
+      }
+    });
     _observer.observe(findLobbyContainer(), { childList: true, subtree: true });
     _renderTimer = setInterval(() => { if (State.tracking) UI.render(); }, RENDER_TICK_MS);
+    _tickTimer = setInterval(tickTimers, 1000);
   }
 
   function stopTracking() {
@@ -767,7 +788,80 @@
     if (_observer) { _observer.disconnect(); _observer = null; }
     if (_throttleTimer) { clearTimeout(_throttleTimer); _throttleTimer = null; }
     if (_renderTimer) { clearInterval(_renderTimer); _renderTimer = null; }
+    if (_tickTimer) { clearInterval(_tickTimer); _tickTimer = null; }
+    removeInlineTimers();
     UI.render();
+  }
+
+  /* injectLobbyTimers — add a countdown span to each tracked game row in the
+     live Torn DOM.  Only one span per row; survivors of React rerenders are
+     updated in place by updateLobbyTimers().  Rows without a matching State
+     entry (unknown firstSeen) receive "Age unknown" text. */
+  function injectLobbyTimers() {
+    try {
+      const section = findGamesSection();
+      if (!section) return;
+      const rowsWrap = findRowsWrap(section);
+      if (!rowsWrap) return;
+      const now = Date.now();
+      Array.from(rowsWrap.children).forEach(function (row) {
+        if (!row.id || !/^\d+$/.test(row.id)) return;
+        const gId = row.id;
+        /* Find the matching State entry by gameId */
+        let entry = null;
+        State.games.forEach(function (e) { if (e.gameId === gId) entry = e; });
+        /* Skip if already has our timer span */
+        if (row.querySelector('[data-rrmt-timer]')) {
+          return;
+        }
+        /* Find "Waiting..." or status text node — inject after it */
+        const span = document.createElement('span');
+        span.setAttribute('data-rrmt-timer', gId);
+        span.style.cssText = 'margin-left:6px;font-size:10px;color:#8060b0;font-style:italic';
+        span.textContent = entry ? formatCountdown(entry.firstSeen, now) : 'Age unknown';
+        /* Append to the row — after any existing text */
+        row.appendChild(span);
+      });
+    } catch (e) { /* defensive — never crash the tracker */ }
+  }
+
+  function updateLobbyTimers(now) {
+    try {
+      const spans = document.querySelectorAll('[data-rrmt-timer]');
+      for (let i = 0; i < spans.length; i++) {
+        const span = spans[i];
+        const gId = span.getAttribute('data-rrmt-timer');
+        let entry = null;
+        State.games.forEach(function (e) { if (e.gameId === gId) entry = e; });
+        span.textContent = entry ? formatCountdown(entry.firstSeen, now) : 'Age unknown';
+      }
+    } catch (e) { /* defensive */ }
+  }
+
+  function removeInlineTimers() {
+    try {
+      const spans = document.querySelectorAll('[data-rrmt-timer]');
+      for (let i = 0; i < spans.length; i++) {
+        const s = spans[i];
+        if (s.parentNode) s.parentNode.removeChild(s);
+      }
+    } catch (e) { /* defensive */ }
+  }
+
+  function tickTimers() {
+    if (!State.tracking) return;
+    const now = Date.now();
+    /* Lightweight panel timer updates — avoid full render() each second */
+    try {
+      State.games.forEach(function (g) {
+        const el = UI.getTimerEl(g.gameKey);
+        if (el) el.textContent = formatCountdown(g.firstSeen, now);
+      });
+    } catch (e) { /* defensive */ }
+    /* Update inline lobby row timers */
+    updateLobbyTimers(now);
+    /* Re-inject for any new rows that appeared since last scan */
+    injectLobbyTimers();
   }
 
   /* ============================ 8. UI ============================ */
@@ -853,11 +947,7 @@
           if (g.playerCount != null) html += '&nbsp;&middot;&nbsp;Players:&nbsp;' + g.playerCount;
           if (g.gameId) html += '&nbsp;&middot;&nbsp;<span style="color:#3a2050;font-size:10px">ID:' + esc(g.gameId) + '</span>';
           html += '</div><div class="ga">Observed: ' + esc(formatAge(g.firstSeen, now)) + '</div>';
-          if (g.firstSeen != null) {
-            const rem = estimatedRemaining(g.firstSeen, now);
-            const rm = Math.floor(rem / 60000), rs = Math.floor((rem % 60000) / 1000);
-            html += '<div class="ge">Est. remaining (\u224815 min, not guaranteed): ' + rm + 'm ' + rs + 's</div>';
-          }
+          html += '<div class="ge" id="rrmt-tm-' + esc(g.gameKey) + '">Est. remaining (\u224815 min, not guaranteed): ' + esc(formatCountdown(g.firstSeen, now)) + '</div>';
           html += '</div>';
         }
       }
@@ -947,6 +1037,7 @@
     function close() { _open = false; if ($ov) $ov.classList.remove('open'); if ($fab) $fab.classList.remove('hide'); }
     function isOpen()  { return _open; }
     function isAlive() { return !!(host && host.isConnected); }
+    function getTimerEl(key) { return shadow ? shadow.getElementById('rrmt-tm-' + key) : null; }
 
     function destroy() {
       stopTracking();
@@ -993,12 +1084,20 @@
       attach();
     }
 
-    return { build, destroy, render, open, close, isOpen, isAlive };
+    return { build, destroy, render, open, close, isOpen, isAlive, getTimerEl };
   })();
 
   /* ============================ 9. NAVIGATION ============================ */
   window.addEventListener('popstate', function onNav() {
     if (!isRRPage()) { stopTracking(); UI.destroy(); window.removeEventListener('popstate', onNav); }
+  }, { passive: true });
+
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) {
+      if (_tickTimer) { clearInterval(_tickTimer); _tickTimer = null; }
+    } else if (State.tracking && !_tickTimer) {
+      _tickTimer = setInterval(tickTimers, 1000);
+    }
   }, { passive: true });
 
   /* ============================ 10. BOOT ============================ */
@@ -1009,12 +1108,14 @@
     if (window.__RRMT_EXPOSE__ === true) {
       window.__RRMT_TEST__ = {
         VERSION, isRRPage, parseBet, parseMinBet, gameKey,
-        formatAge, estimatedRemaining,
+        formatAge, estimatedRemaining, formatCountdown,
         safeClass, sanitizeHref, getPlayerName,
         _isSectionCandidate, findGamesSection, findRowsWrap, findRowContainer, extractGameIdFromEl,
         parseRRLobby, processGames,
         logEvent, exportLog, captureDomDiag,
-        startTracking, stopTracking, State, UI,
+        startTracking, stopTracking,
+        injectLobbyTimers, updateLobbyTimers, removeInlineTimers, tickTimers,
+        State, UI,
         UI_LABEL,
       };
     }
