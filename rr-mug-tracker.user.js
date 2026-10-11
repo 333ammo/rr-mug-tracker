@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RR Mug Tracker
 // @namespace    fatboy.torn
-// @version      0.3.4
+// @version      1.0.0
 // @description  Russian Roulette lobby tracker with disappearance-watch intelligence for Torn PDA (iOS) and desktop.
 // @author       FATBOY [572123]
 // @match        https://www.torn.com/page.php*
@@ -13,6 +13,27 @@
 // ==/UserScript==
 
 /*
+ * RR Mug Tracker v1.0.0 — Hospital classification, live timers, reliable status checks, BUSTR-inspired scoring.
+ *
+ * v1.0.0 changes:
+ *   - Hospital reason classifier: SELF_HOSP_BLOOD_BAG, SELF_HOSP_IPECAC, RR_LOSS_INDICATED,
+ *     MUGGED_INDICATED, HOSPITAL_UNKNOWN, OKAY_UNCONFIRMED.  Classifies from API
+ *     status.description / status.details.  Conservative: only explicit text matches qualify.
+ *   - Live "Gone for" elapsed timer and "Next check" countdown in Disappearance Watch
+ *     cards, updated every second via tickTimers() without a full panel re-render.
+ *   - Status-check reliability: single transient retry (400 ms), stalled _inFlight
+ *     timeout guard (15 s), Torn rate-limit envelope code 5 detection, stale-response
+ *     guard.  Prevents permanent "checking…" indicators.
+ *   - BUSTR-inspired priority score: named component model (base, bet, status evidence,
+ *     uncertainty penalty), shrink toward 50 (conservative calibration), hospital always
+ *     suppresses to 0.  Hospital label shown in status line instead of generic "Hospital".
+ *   - statusObs array on entries: up to 10 raw {state, description, ts} observations
+ *     preserved across status changes and exports.
+ *   - hospitalLabel, hospitalReason, hospitalUntil fields added to entries; round-tripped
+ *     through persistence and exports; CSV adds hospitalReason + hospitalLabel columns.
+ *   - All 173 v0.3.4 regression tests preserved; new suite W (W1–W21) added.
+ *   - DE_STORE_VERSION and DE_STORE_KEY unchanged — old saves load without migration.
+ *
  * RR Mug Tracker v0.3.4 — Disappearance Watch minimum bet display filter.
  *
  * v0.3.4 changes:
@@ -300,7 +321,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '0.3.4';
+  const VERSION = '1.0.0';
   if (window.top !== window.self) return;
 
   /* isRRPage accepts optional (pn, qs) args for test-harness use */
@@ -341,7 +362,9 @@
   const DE_STORE_VERSION        = 1;
   const DE_SAVE_THROTTLE_MS     = 5000;
   const DW_PREF_KEY             = 'rrmt_dw_pref';  /* separate key — never mixed with DE_STORE_KEY */
-  const DEFAULT_DW_MIN_BET      = 50000000;         /* 50M default watch display filter */
+  const DEFAULT_DW_MIN_BET      = 50000000;         /* $50M default watch display filter */
+  const DE_INFLIGHT_TIMEOUT_MS  = 15000;            /* force-clear stalled _inFlight guard */
+  const DE_RETRY_DELAY_MS       = 400;              /* delay before single transient retry */
 
   /* Profile-link texts that are UI chrome, not player names */
   const UI_LABEL = /^(view\s+profile\.?|premium\s+data|follow|unfollow|report|trade|send\s+message|send\s+gift|bounty|add\s+to\s+friend)$/i;
@@ -952,6 +975,13 @@
   }
 
   /* ============================ 5. TIMERS ============================ */
+  function formatBet(n) {
+    if (n == null) return 'Unknown';
+    if (n >= 1e9) return '$' + (n / 1e9).toFixed(2).replace(/\.?0+$/, '') + 'B';
+    if (n >= 1e6) return '$' + (n / 1e6).toFixed(1).replace(/\.0$/, '') + 'M';
+    return '$' + n.toLocaleString();
+  }
+
   function formatAge(firstSeen, now) {
     if (firstSeen == null) return 'Age unknown';
     const ms = (now != null ? now : Date.now()) - firstSeen;
@@ -975,6 +1005,15 @@
     const m = Math.floor(totalSec / 60);
     const s = totalSec % 60;
     return m + ':' + (s < 10 ? '0' + s : '' + s);
+  }
+
+  function formatCountdownTo(targetTs, now) {
+    var rem = targetTs - (now != null ? now : Date.now());
+    if (rem <= 0) return 'checking\u2026';
+    var totalSec = Math.ceil(rem / 1000);
+    var m = Math.floor(totalSec / 60);
+    var s = totalSec % 60;
+    return m > 0 ? m + 'm\u202F' + s + 's' : s + 's';
   }
 
   /* ============================ 6. GAME PROCESSING ============================ */
@@ -1195,10 +1234,50 @@
     injectLobbyTimers(now);
     DisappearanceEngine.tick(now);
     StatusChecker.tick(now);
+    UI.tickDwTimers(now, StatusChecker.canCheck());
     if (DisappearanceEngine.isDirty()) {
       PersistenceStore.save(now);
       DisappearanceEngine.clearDirty();
     }
+  }
+
+  /* ============================ 8a. HOSPITAL CLASSIFIER ============================ */
+  /*
+   * Classifies hospital reason from Torn API status fields conservatively.
+   * Only explicit text matches qualify — never infers cause from duration or
+   * disappearance pattern alone.  A hospitalisation may predate or postdate
+   * the observed RR game.
+   */
+  const HOSP_REASONS = Object.freeze({
+    SELF_HOSP_BLOOD_BAG : 'SELF_HOSP_BLOOD_BAG',
+    SELF_HOSP_IPECAC    : 'SELF_HOSP_IPECAC',
+    RR_LOSS_INDICATED   : 'RR_LOSS_INDICATED',
+    MUGGED_INDICATED    : 'MUGGED_INDICATED',
+    HOSPITAL_UNKNOWN    : 'HOSPITAL_UNKNOWN',
+    OKAY_UNCONFIRMED    : 'OKAY_UNCONFIRMED',
+  });
+
+  function classifyHospitalReason(state, description, details) {
+    if (state !== 'Hospital') {
+      return { code: HOSP_REASONS.OKAY_UNCONFIRMED, label: 'Okay \u2014 not hospitalised', confidence: 'observed' };
+    }
+    var text = ((description || '') + ' ' + (details || '')).replace(/\s+/g, ' ').trim();
+    if (!text) {
+      return { code: HOSP_REASONS.HOSPITAL_UNKNOWN, label: 'Hospital \u2014 reason unknown', confidence: 'unknown' };
+    }
+    if (/blood[\s\-]?bag/i.test(text) || /incompatible.*blood/i.test(text) || /blood.*incompatible/i.test(text)) {
+      return { code: HOSP_REASONS.SELF_HOSP_BLOOD_BAG, label: 'Hospital \u2014 blood bag', confidence: 'explicit' };
+    }
+    if (/ipecac/i.test(text)) {
+      return { code: HOSP_REASONS.SELF_HOSP_IPECAC, label: 'Hospital \u2014 Ipecac Syrup', confidence: 'explicit' };
+    }
+    if (/russian\s*roulette/i.test(text)) {
+      return { code: HOSP_REASONS.RR_LOSS_INDICATED, label: 'Hospital \u2014 RR loss indicated', confidence: 'explicit' };
+    }
+    if (/mugged?\s+by\b/i.test(text)) {
+      return { code: HOSP_REASONS.MUGGED_INDICATED, label: 'Hospital \u2014 mugged', confidence: 'explicit' };
+    }
+    return { code: HOSP_REASONS.HOSPITAL_UNKNOWN, label: 'Hospital \u2014 reason unknown', confidence: 'unknown' };
   }
 
   /* ============================ 8. DISAPPEARANCE ENGINE ============================ */
@@ -1245,6 +1324,10 @@
         priority:      0,
         priorityReason:'',
         outcome:       null,
+        hospitalReason:null,   /* HOSP_REASONS code */
+        hospitalLabel: null,   /* human-readable hospital classification */
+        hospitalUntil: null,   /* seconds epoch: when hospital ends (from API) */
+        statusObs:     [],     /* [{state, description, ts}] — last 10 observations */
       };
     }
 
@@ -1255,55 +1338,101 @@
     }
 
     function _computePriority(entry, now) {
-      if (entry.state === 'HOSPITAL') return { score: 0, reason: 'Host in hospital — not actionable' };
-      if (!entry.confirmedTs)         return { score: 0, reason: '' };
+      /* Hospital: always 0, never actionable */
+      if (entry.state === 'HOSPITAL') {
+        return { score: 0, reason: entry.hospitalLabel || 'Hospital \u2014 not actionable' };
+      }
+      if (!entry.confirmedTs) return { score: 0, reason: '' };
 
-      const base   = (entry.firstSeen === null) ? 35 : 50;
-      /* Filter out ERROR slots and stale results (API data predates disappearance) */
-      const checks = entry.statusChecks.filter(function (c) {
+      var elapsed = now - entry.confirmedTs;
+
+      /* Fully expired: return floor directly (shrink does not apply to decay floor) */
+      if (elapsed >= DE_DECAY_END_MS) {
+        return { score: DE_DECAY_FLOOR, reason: 'Timed out (' + Math.round(elapsed / 60000) + 'm ago)' };
+      }
+
+      /* Filter out ERROR slots and stale pre-disappearance API data */
+      var checks = entry.statusChecks.filter(function (c) {
         if (!c.result || c.result === 'ERROR') return false;
         if (c.apiTs !== null && typeof c.apiTs === 'number' && c.apiTs < entry.confirmedTs) return false;
         return true;
       });
-      const okays  = checks.filter(function (c) { return c.result === 'Okay'; });
-      /* +15s bonus only if that specific slot carries a fresh Okay */
-      const ok15   = entry.statusChecks.find(function (c) {
+      var okays = checks.filter(function (c) { return c.result === 'Okay'; });
+      var ok15  = entry.statusChecks.find(function (c) {
         if (c.offset !== 15000 || c.result !== 'Okay') return false;
         if (c.apiTs !== null && typeof c.apiTs === 'number' && c.apiTs < entry.confirmedTs) return false;
         return true;
       });
 
-      let bonus = 0;
-      var reasons = [];
-      if (ok15)          { bonus += 20; reasons.push('Okay at +15 s'); }
-      else if (okays.length) { bonus += 10; reasons.push('Okay status seen'); }
+      /* === BUSTR-inspired component model ===
+       * Named factors; shrink toward 50 prevents overconfidence calibration.
+       */
+      var SHRINK_CENTER = 50, SHRINK_K = 0.60;
+      var components = [];
+
+      /* Base: known vs unknown first-seen age */
+      components.push({ value: entry.firstSeen !== null ? 50 : 35,
+                        reason: entry.firstSeen !== null ? 'Game age known' : 'Age unknown' });
+
+      /* Bet size (+0 to +20) */
+      var betBonus = 0;
+      if (entry.bet != null) {
+        if      (entry.bet >= 1000000000) betBonus = 20;
+        else if (entry.bet >= 500000000)  betBonus = 15;
+        else if (entry.bet >= 200000000)  betBonus = 12;
+        else if (entry.bet >= 100000000)  betBonus = 8;
+        else if (entry.bet >=  50000000)  betBonus = 5;
+      }
+      if (betBonus > 0) components.push({ value: betBonus, reason: 'Wager ' + formatBet(entry.bet) });
+
+      /* Status evidence (+0 to +25) */
+      var statusBonus = 0, statusReasons = [];
+      if (ok15)             { statusBonus = 20; statusReasons.push('Okay at +15\u202Fs'); }
+      else if (okays.length){ statusBonus = 10; statusReasons.push('Okay observed'); }
       if (okays.length > 1) {
-        bonus += Math.min(5 * (okays.length - 1), 10);
-        reasons.push('Confirmed Okay ×' + okays.length);
+        statusBonus = Math.min(statusBonus + Math.min(5 * (okays.length - 1), 5), 25);
+        statusReasons.push('Okay \xd7' + okays.length);
       }
+      if (statusBonus > 0) components.push({ value: statusBonus, reason: statusReasons.join('; ') });
 
-      let score = Math.min(base + bonus, 90);
+      /* Uncertainty penalty */
+      if      (!checks.length) components.push({ value: -10, reason: 'No checks yet' });
+      else if (!okays.length)  components.push({ value:  -5, reason: 'Checked \u2014 never Okay' });
 
-      if (!checks.length)       score = Math.min(score, 60);   /* no status data */
-      else if (!okays.length)   score = Math.min(score, 50);   /* all non-Okay */
+      /* Compute raw score */
+      var rawScore = 0;
+      for (var ci = 0; ci < components.length; ci++) rawScore += components[ci].value;
+      rawScore = Math.max(1, Math.min(100, rawScore));
 
-      /* Age decay */
-      const elapsed = now - entry.confirmedTs;
-      if (elapsed >= DE_DECAY_END_MS) {
-        score = DE_DECAY_FLOOR;
-      } else if (elapsed > DE_DECAY_START_MS) {
-        const frac = (elapsed - DE_DECAY_START_MS) / (DE_DECAY_END_MS - DE_DECAY_START_MS);
-        score = Math.round(score * (1 - frac) + DE_DECAY_FLOOR * frac);
+      /* Evidence caps */
+      if      (!checks.length) rawScore = Math.min(rawScore, 60);
+      else if (!okays.length)  rawScore = Math.min(rawScore, 55);
+
+      /* BUSTR shrink toward center */
+      var shrunk = Math.round(SHRINK_CENTER + SHRINK_K * (rawScore - SHRINK_CENTER));
+      shrunk = Math.max(1, Math.min(100, shrunk));
+
+      /* Age decay blend toward floor */
+      var finalScore = shrunk;
+      if (elapsed > DE_DECAY_START_MS) {
+        var frac = (elapsed - DE_DECAY_START_MS) / (DE_DECAY_END_MS - DE_DECAY_START_MS);
+        finalScore = Math.round(shrunk * (1 - frac) + DE_DECAY_FLOOR * frac);
       }
-      score = Math.max(DE_DECAY_FLOOR, Math.min(100, score));
+      finalScore = Math.max(DE_DECAY_FLOOR, Math.min(100, finalScore));
 
-      const ageMin = Math.round(elapsed / 60000);
-      const ageStr = ageMin > 0 ? '; ' + ageMin + 'm ago' : '';
-      const reasonStr = reasons.length
-        ? reasons.join('; ') + ageStr
-        : (checks.length ? 'Status checked — not Okay' : 'Status unknown') + ageStr;
+      /* Assemble reason string from components */
+      var ageMin = Math.round(elapsed / 60000);
+      var ageStr = ageMin > 0 ? '; ' + ageMin + 'm ago' : '';
+      var pos = [], neg = [];
+      for (var ri = 0; ri < components.length; ri++) {
+        if (components[ri].value > 0) pos.push(components[ri].reason);
+        else                           neg.push(components[ri].reason);
+      }
+      var reasonStr = pos.join('; ') || (checks.length ? 'Checked \u2014 not Okay' : 'No checks yet');
+      if (neg.length) reasonStr += ' [' + neg.join('; ') + ']';
+      reasonStr += ageStr;
 
-      return { score: score, reason: reasonStr };
+      return { score: finalScore, reason: reasonStr };
     }
 
     function _archiveIfDone(entry) {
@@ -1311,6 +1440,8 @@
       if (!terminal) return;
       _history.unshift(Object.assign({}, entry, {
         statusChecks: entry.statusChecks.map(function (s) { return Object.assign({}, s); }),
+        statusObs:    Array.isArray(entry.statusObs)
+          ? entry.statusObs.map(function (o) { return Object.assign({}, o); }) : [],
       }));
       if (_history.length > DE_HISTORY_MAX) _history.pop();
       _watches.delete(entry.gameId);
@@ -1517,8 +1648,8 @@
 
     /* Production path: called by StatusChecker after it fills the slot directly.
        Does NOT do proximity slot-matching — the slot was already filled by reference.
-       Updates latestStatus, handles hospital suppression, recomputes priority. */
-    function _updateStatusResult(gameId, status, ts, apiTs) {
+       Updates latestStatus, records observation, classifies hospital reason, recomputes priority. */
+    function _updateStatusResult(gameId, status, ts, apiTs, description, details, until) {
       var entry = _watches.get(gameId);
       if (!entry) return;
       if (entry.state !== 'CONFIRMED' && entry.state !== 'HOSPITAL') return;
@@ -1527,9 +1658,18 @@
         entry.latestStatus   = status;
         entry.latestStatusTs = ts;
       }
+      /* Record raw observation (capped at 10) */
+      if (!Array.isArray(entry.statusObs)) entry.statusObs = [];
+      entry.statusObs.push({ state: status, description: description || '', ts: ts });
+      if (entry.statusObs.length > 10) entry.statusObs.shift();
+      /* Hospital: classify reason, mark suppressed */
       if (status === 'Hospital' && isLatest) {
         entry.state       = 'HOSPITAL';
         entry.stateReason = 'Host in hospital — not actionable';
+        var cls = classifyHospitalReason(status, description, details);
+        entry.hospitalReason = cls.code;
+        entry.hospitalLabel  = cls.label;
+        if (typeof until === 'number') entry.hospitalUntil = until;
       }
       var pr = _computePriority(entry, ts);
       entry.priority       = pr.score;
@@ -1542,6 +1682,8 @@
       _watches.forEach(function (entry) {
         watches.push(Object.assign({}, entry, {
           statusChecks: entry.statusChecks.map(function (s) { return Object.assign({}, s); }),
+          statusObs: Array.isArray(entry.statusObs)
+            ? entry.statusObs.map(function (o) { return Object.assign({}, o); }) : [],
         }));
       });
       return {
@@ -1550,6 +1692,8 @@
           return Object.assign({}, e, {
             statusChecks: Array.isArray(e.statusChecks)
               ? e.statusChecks.map(function (s) { return Object.assign({}, s); }) : [],
+            statusObs: Array.isArray(e.statusObs)
+              ? e.statusObs.map(function (o) { return Object.assign({}, o); }) : [],
           });
         }),
       };
@@ -1564,12 +1708,16 @@
         var w = data.watches[i];
         if (!w || !w.gameId) continue;
         if (_watches.has(w.gameId)) continue;
-        var restored = Object.assign({}, w, {
+        var restored = Object.assign({
+          hospitalReason: null, hospitalLabel: null, hospitalUntil: null, statusObs: [],
+        }, w, {
           statusChecks: Array.isArray(w.statusChecks)
             ? w.statusChecks.map(function (s) { return Object.assign({}, s); })
             : DE_STATUS_OFFSETS.map(function (o) {
                 return { offset: o, scheduledAt: null, result: null, error: null, ts: null, apiTs: null };
               }),
+          statusObs: Array.isArray(w.statusObs)
+            ? w.statusObs.map(function (o) { return Object.assign({}, o); }) : [],
         });
         /* Terminal states belong in history, not watches */
         if (restored.state === 'EXPIRED' || restored.state === 'DISMISSED' || restored.state === 'MOOT') continue;
@@ -1589,9 +1737,13 @@
       for (var j = 0; j < data.history.length; j++) {
         var h = data.history[j];
         if (!h || !h.gameId || existingIds.has(h.gameId)) continue;
-        _history.push(Object.assign({}, h, {
+        _history.push(Object.assign({
+          hospitalReason: null, hospitalLabel: null, hospitalUntil: null, statusObs: [],
+        }, h, {
           statusChecks: Array.isArray(h.statusChecks)
             ? h.statusChecks.map(function (s) { return Object.assign({}, s); }) : [],
+          statusObs: Array.isArray(h.statusObs)
+            ? h.statusObs.map(function (o) { return Object.assign({}, o); }) : [],
         }));
         existingIds.add(h.gameId);
       }
@@ -1755,8 +1907,27 @@
    * or console output.
    */
   const StatusChecker = (function () {
-    let _inFlight = false;
-    let _lastAt   = 0;
+    let _inFlight      = false;
+    let _inFlightSince = 0;
+    let _lastAt        = 0;
+    let _currentToken  = null;  /* invalidated on force-clear; callbacks check identity */
+
+    function _isClientError(err) {
+      if (!err) return false;
+      /* 4xx HTTP, Torn rate-limit, and parse errors are not retried */
+      return /^HTTP\s+4\d\d/.test(err) || /rate.limit|torn.code/i.test(err) || /parse.error/i.test(err);
+    }
+
+    function _doFetchWithRetry(playerId, key, cb) {
+      _doFetch(playerId, key, function (status, err, apiTs, description, details, until) {
+        if (!status && !_isClientError(err)) {
+          /* Transient failure — single retry after brief delay */
+          setTimeout(function () { _doFetch(playerId, key, cb); }, DE_RETRY_DELAY_MS);
+        } else {
+          cb(status, err, apiTs, description, details, until);
+        }
+      });
+    }
 
     function _effectiveKey() {
       /* PDA replaces DE_PDA_KEY at install time; in TM/VM user enters key in UI */
@@ -1769,20 +1940,26 @@
     function _parseResp(text, cb) {
       try {
         var json = JSON.parse(text);
-        /* v2: { profile: { status: { state } } }
-           alt: { basic: { status: { state } } }  or v1: { status: { state } } */
-        var state =
-          (json.profile && json.profile.status && json.profile.status.state) ||
-          (json.basic   && json.basic.status   && json.basic.status.state)   ||
-          (json.status  && json.status.state)   ||
+        /* Torn rate-limit: 200 OK with error envelope code 5 */
+        if (json.error && json.error.code === 5) { cb(null, 'Rate limited (Torn code 5)'); return; }
+        /* v2: { profile: { status: { … } } }
+           alt: { basic: { status: { … } } }  or v1: { status: { … } } */
+        var statusObj =
+          (json.profile && json.profile.status) ||
+          (json.basic   && json.basic.status)   ||
+          json.status   ||
           null;
+        var state       = statusObj ? (statusObj.state || null) : null;
+        var description = statusObj ? (statusObj.description || '') : '';
+        var details     = statusObj ? (statusObj.details     || '') : '';
+        var until       = statusObj && typeof statusObj.until === 'number' ? statusObj.until : null;
         var apiTs = (json.timestamp && typeof json.timestamp === 'number')
                     ? json.timestamp * 1000 : null;
         if (!state) {
           var apiErr = json.error ? (json.error.error || String(json.error)) : 'No state in response';
           cb(null, apiErr); return;
         }
-        cb(state, null, apiTs);
+        cb(state, null, apiTs, description, details, until);
       } catch (e) { cb(null, 'Parse error'); }
     }
 
@@ -1833,6 +2010,11 @@
 
     function tick(now) {
       if (!State.statusEnabled) return;
+      /* Force-clear a stalled in-flight guard (e.g. PDA promise never resolved) */
+      if (_inFlight && (now - _inFlightSince) > DE_INFLIGHT_TIMEOUT_MS) {
+        _currentToken = null;          /* reject any in-flight callback from timed-out request */
+        _inFlight = false; _inFlightSince = 0;
+      }
       if (_inFlight) return;
       var key = _effectiveKey();
       if (!key) return;
@@ -1842,17 +2024,32 @@
       if (!due.length) return;
 
       var item = due[0];
-      _inFlight = true;
-      _lastAt   = now;
+      /* Stale-response guard: verify game is still trackable */
+      var stillTracked = (function () {
+        var cands = DisappearanceEngine.getCandidates();
+        for (var si = 0; si < cands.length; si++) {
+          if (cands[si].gameId === item.gameId) return true;
+        }
+        return false;
+      }());
+      if (!stillTracked) return;
 
-      _doFetch(item.playerId, key, function (status, err, apiTs) {
-        _inFlight = false;
+      var myToken    = (_currentToken = {});  /* fresh token — stale callbacks will not match */
+      _inFlight      = true;
+      _inFlightSince = now;
+      _lastAt        = now;
+
+      _doFetchWithRetry(item.playerId, key, function (status, err, apiTs, description, details, until) {
+        if (_currentToken !== myToken) return;  /* timed-out or superseded request — discard */
+        _currentToken  = null;
+        _inFlight      = false;
+        _inFlightSince = 0;
         var ts = Date.now();
         if (status) {
           item.slot.result = status;
           item.slot.ts     = ts;
           item.slot.apiTs  = apiTs || null;
-          DisappearanceEngine._updateStatusResult(item.gameId, status, ts, apiTs);
+          DisappearanceEngine._updateStatusResult(item.gameId, status, ts, apiTs, description, details, until);
         } else {
           /* Mark slot errored so it is not re-queued */
           item.slot.result = 'ERROR';
@@ -1867,7 +2064,21 @@
     function canCheck() { return State.statusEnabled && !!_effectiveKey(); }
     function _parseRespTest(text, cb) { _parseResp(text, cb); } /* test-only */
 
-    return { tick, canCheck, _parseRespTest };
+    /* test-only helpers — not called by production code */
+    function _testState() {
+      return { inFlight: _inFlight, inFlightSince: _inFlightSince, hasToken: _currentToken !== null };
+    }
+    function _testSetFlight(v, since) {
+      _inFlight = v; _inFlightSince = since || 0;
+      _currentToken = v ? {} : null;
+    }
+    function _testForceExpireClear(now) {
+      /* Simulates the force-clear path without requiring real elapsed time */
+      _currentToken = null;
+      _inFlight = false; _inFlightSince = 0;
+    }
+
+    return { tick, canCheck, _parseRespTest, _testState, _testSetFlight, _testForceExpireClear };
   })();
 
   /* ============================ 11. EXPORT / IMPORT HELPERS ============================ */
@@ -1907,13 +2118,14 @@
         return w.state === 'CONFIRMED' || w.state === 'HOSPITAL';
       })
     );
-    var rows = ['gameId,playerName,playerId,bet,confirmedAt,outcome,latestStatus,priority,state'];
+    var rows = ['gameId,playerName,playerId,bet,confirmedAt,outcome,latestStatus,hospitalReason,hospitalLabel,priority,state'];
     for (var i = 0; i < all.length; i++) {
       var e = all[i];
       rows.push([
         csvField(e.gameId), csvField(e.playerName), csvField(e.playerId),
         csvField(e.bet),    csvField(e.confirmedTs), csvField(e.outcome),
-        csvField(e.latestStatus), csvField(e.priority), csvField(e.state),
+        csvField(e.latestStatus), csvField(e.hospitalReason), csvField(e.hospitalLabel),
+        csvField(e.priority), csvField(e.state),
       ].join(','));
     }
     return rows.join('\r\n');
@@ -2006,6 +2218,7 @@
       '.dw-cfg input[type=password]{max-width:130px;padding:3px 6px;border-radius:4px;border:1px solid #3a1a5a;background:#080410;color:#ddd0f0;font:10px inherit}',
       '.dw-cfg input[type=text]{width:60px;padding:3px 6px;border-radius:4px;border:1px solid #3a1a5a;background:#080410;color:#ddd0f0;font:10px inherit}',
       '.dw-cnt{font-size:10px;color:#3a2050;padding:4px 0 2px;text-align:right}',
+      '.dwnt{color:#7a5090;font-variant-numeric:tabular-nums}',
       '.dw-hist{margin-top:4px;padding-top:4px;border-top:1px solid #1e1030;font-size:10px;color:#5a4070}',
       '.dw-hist-item{padding:2px 0;display:flex;gap:5px;align-items:baseline;flex-wrap:wrap}',
       '.dw-hist-nm{color:#6a5070}',
@@ -2120,18 +2333,36 @@
           html += '<div class="dwx">Bet:&nbsp;' + esc(fmtBet(dc.bet));
           if (dc.gameId) html += '&nbsp;&middot;&nbsp;Game:&nbsp;' + esc(dc.gameId);
           html += '</div>';
-          /* Time info */
+          /* Time info — elapsed uses a live span updated by tickDwTimers each second */
           var dwElapsed = dc.confirmedTs ? formatAge(dc.confirmedTs, now) : '?';
           var dwObs     = formatAge(dc.firstSeen, now);
-          html += '<div class="dwx">Gone:&nbsp;' + esc(dwElapsed) + '&nbsp;&middot;&nbsp;Observed:&nbsp;' + esc(dwObs) + '</div>';
-          /* Status */
+          var dwElapsedAttr = dc.confirmedTs ? ' data-rrmt-dw-elapsed="' + dc.confirmedTs + '"' : '';
+          /* Next scheduled check */
+          var dwNextTs = null;
+          for (var nci = 0; nci < dc.statusChecks.length; nci++) {
+            var ncs = dc.statusChecks[nci];
+            if (ncs.result === null && ncs.scheduledAt !== null) {
+              if (dwNextTs === null || ncs.scheduledAt < dwNextTs) dwNextTs = ncs.scheduledAt;
+            }
+          }
+          var dwNextHtml = '';
+          if (dwNextTs !== null && State.statusEnabled && StatusChecker.canCheck()) {
+            var dwNextAttr = ' data-rrmt-dw-next="' + dwNextTs + '"';
+            dwNextHtml = '&nbsp;&middot;&nbsp;Next:&nbsp;<span class="dwnt"' + dwNextAttr + '>' +
+                         esc(formatCountdownTo(dwNextTs, now)) + '</span>';
+          }
+          html += '<div class="dwx">Gone:&nbsp;<span' + dwElapsedAttr + '>' + esc(dwElapsed) +
+                  '</span>&nbsp;&middot;&nbsp;Observed:&nbsp;' + esc(dwObs) + dwNextHtml + '</div>';
+          /* Status — show hospital classification label instead of bare "Hospital" */
           var dwStCls = dc.latestStatus === 'Okay' ? 'ok' : dc.latestStatus === 'Hospital' ? 'ho' : '';
           html += '<div class="dwst ' + dwStCls + '">';
           if (!State.statusEnabled) {
             html += 'Status: checks disabled';
           } else if (dc.latestStatus) {
             var dwStAge = dc.latestStatusTs ? ('&nbsp;(' + esc(formatAge(dc.latestStatusTs, now)) + ' ago)') : '';
-            html += 'Status:&nbsp;<strong>' + esc(dc.latestStatus) + '</strong>' + dwStAge;
+            var dwStatusLabel = (dc.latestStatus === 'Hospital' && dc.hospitalLabel)
+              ? dc.hospitalLabel : dc.latestStatus;
+            html += 'Status:&nbsp;<strong>' + esc(dwStatusLabel) + '</strong>' + dwStAge;
           } else if (StatusChecker.canCheck()) {
             html += 'Status: checking\u2026';
           } else {
@@ -2473,6 +2704,31 @@
     function isAlive() { return !!(host && host.isConnected); }
     function getTimerEl(key) { return shadow ? shadow.getElementById('rrmt-tm-' + key) : null; }
 
+    function tickDwTimers(now, canCheck) {
+      if (!shadow) return;
+      /* "Gone for" elapsed timers */
+      var elEls = shadow.querySelectorAll('[data-rrmt-dw-elapsed]');
+      for (var i = 0; i < elEls.length; i++) {
+        var el = elEls[i];
+        var cts = Number(el.getAttribute('data-rrmt-dw-elapsed'));
+        if (cts > 0) el.textContent = formatAge(cts, now);
+      }
+      /* "Next check" countdown timers */
+      var nxEls = shadow.querySelectorAll('[data-rrmt-dw-next]');
+      for (var j = 0; j < nxEls.length; j++) {
+        var nx = nxEls[j];
+        var nts = Number(nx.getAttribute('data-rrmt-dw-next'));
+        if (!nts) continue;
+        if (nts > now) {
+          nx.textContent = formatCountdownTo(nts, now);
+        } else {
+          /* Scheduled time has passed but render() hasn't fired yet — show intent, not false progress */
+          nx.textContent = canCheck ? 'due\u2026' : 'pending';
+          /* Attribute stays; render() removes this span once slot.result is filled */
+        }
+      }
+    }
+
     function destroy() {
       stopTracking();
       if (host && host.parentNode) host.parentNode.removeChild(host);
@@ -2518,7 +2774,7 @@
       attach();
     }
 
-    return { build, destroy, render, open, close, isOpen, isAlive, getTimerEl };
+    return { build, destroy, render, open, close, isOpen, isAlive, getTimerEl, tickDwTimers };
   })();
 
   /* ============================ 9. NAVIGATION ============================ */
@@ -2548,7 +2804,8 @@
     if (window.__RRMT_EXPOSE__ === true) {
       window.__RRMT_TEST__ = {
         VERSION, isRRPage, parseBet, parseMinBet, gameKey,
-        formatAge, estimatedRemaining, formatCountdown,
+        formatAge, estimatedRemaining, formatCountdown, formatCountdownTo,
+        HOSP_REASONS, classifyHospitalReason,
         tornProfileURL, tornAttackURL,
         safeClass, sanitizeHref, getPlayerName,
         _isSectionCandidate, findGamesSection, findRowsWrap, findRowContainer, extractGameIdFromEl,
