@@ -1,15 +1,53 @@
 // ==UserScript==
 // @name         RR Mug Tracker
 // @namespace    fatboy.torn
-// @version      0.2.1
-// @description  Russian Roulette lobby tracker for Torn PDA (iOS): observe active games, log events, show elapsed time.
+// @version      0.3.0
+// @description  Russian Roulette lobby tracker with disappearance-watch intelligence for Torn PDA (iOS) and desktop.
 // @author       FATBOY [572123]
 // @match        https://www.torn.com/page.php*
 // @run-at       document-end
-// @grant        none
+// @grant        GM_xmlhttpRequest
+// @connect      api.torn.com
 // ==/UserScript==
 
 /*
+ * RR Mug Tracker v0.3.0 — Phase 2B: Disappearance Intelligence Engine.
+ * No auto-play, no attacks, no mugging, no automatic actions.
+ *
+ * v0.3.0 changes:
+ *   - DisappearanceEngine: independent module watching for game disappearances and
+ *     scoring them as potential investigation opportunities (NOT win probabilities).
+ *     Interface: observeSnapshot(games, ts, valid), observePlayerStatus(pid, status, ts),
+ *     tick(ts), getCandidates(), getHistory(), resetOrSuspend(), resume(),
+ *     getDueChecks(ts), setOutcome(gameId, label), dismiss(gameId).
+ *     State machine: WATCHING → CANDIDATE → CONFIRMED → HOSPITAL|EXPIRED|DISMISSED.
+ *     Confirmation requires absence from two consecutive valid lobby scans.
+ *     Parser failures, invalid scans, and page suspension do not advance state.
+ *     CANDIDATE entries are reset (→ WATCHING) on page resume to prevent false detections.
+ *   - StatusChecker: bounded, rate-limited status check scheduler.
+ *     Schedules host status checks at +0, +15, +30, +45, +60, +90 s after confirmed
+ *     disappearance.  Disabled by default.  Uses Torn API v2:
+ *       GET https://api.torn.com/v2/user/{id}/basic?key={key}
+ *       Expected field: response.profile.status.state (also handles v1 shape).
+ *     API key: injected by Torn PDA via ###PDA-APIKEY### or entered manually in TM/VM.
+ *     Key is never logged, exported or stored beyond State.apiKey in memory.
+ *     Request method: GM_xmlhttpRequest (TM/VM), PDA_httpGet (PDA native), fetch() fallback.
+ *     Rate: max 1 request per 2.5 s across all candidates; concurrency limit 1.
+ *   - Priority score (0–100): heuristic investigation priority, NOT win probability.
+ *     Base 50 (35 for pre-existing games).  +20 for Okay at +15 s.  +10 for any Okay.
+ *     +5 per extra Okay (cap 90).  Hospital → 0.  No status data → cap 60.
+ *     Linear decay from full at 5 min to floor 5 at 30 min.
+ *   - "Disappearance Watch" section in panel: shows confirmed candidates with priority
+ *     badge, player info, bet, status, reason, Profile/Attack links, Dismiss button,
+ *     and manual outcome labels (Won/Lost/Timeout/Unknown) for future calibration.
+ *   - Status checks enable/disable toggle + API key entry in panel.
+ *   - processGames() feeds DisappearanceEngine after each valid scan.
+ *   - tickTimers() advances DisappearanceEngine.tick() and StatusChecker.tick() each second.
+ *   - Visibility-change handler calls resetOrSuspend()/resume() on tab hide/show.
+ *   - Metadata: @grant GM_xmlhttpRequest, @connect api.torn.com (status checks only).
+ *   - Suite R added: 20 regression tests (R1–R20) covering 15 engine scenarios.
+ *   - All 99 v0.2.1 regression tests preserved.
+ *
  * RR Mug Tracker v0.2.1 — open Profile and Attack links in a new tab.
  * No API calls, no auto-play, no attacks, no mugging.
  *
@@ -185,7 +223,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '0.2.1';
+  const VERSION = '0.3.0';
   if (window.top !== window.self) return;
 
   /* isRRPage accepts optional (pn, qs) args for test-harness use */
@@ -210,19 +248,33 @@
   const DEFAULT_MIN_BET  = 200000000;
   const GAME_TIMEOUT_EST = 15 * 60 * 1000;
 
+  /* DisappearanceEngine constants */
+  const DE_EXPIRE_MS      = 30 * 60 * 1000;
+  const DE_DECAY_START_MS =  5 * 60 * 1000;
+  const DE_DECAY_END_MS   = 30 * 60 * 1000;
+  const DE_DECAY_FLOOR    = 5;
+  const DE_STATUS_OFFSETS = [0, 15000, 30000, 45000, 60000, 90000];
+  const DE_HISTORY_MAX    = 50;
+  const DE_RATE_MS        = 2500;   /* max ~24 status requests / min */
+  const DE_TIMEOUT_MS     = 10000;
+  const DE_PDA_KEY        = '###PDA-APIKEY###';  /* PDA replaces at install time */
+
   /* Profile-link texts that are UI chrome, not player names */
   const UI_LABEL = /^(view\s+profile\.?|premium\s+data|follow|unfollow|report|trade|send\s+message|send\s+gift|bounty|add\s+to\s+friend)$/i;
 
   /* ============================ 2. STATE ============================ */
   const State = {
-    games:     new Map(),  // key → GameEntry
-    log:       [],
-    tracking:  false,
-    parseOk:   null,       // null=not tried, true=ok, false=failed
-    parseNote: '',
-    minBet:    DEFAULT_MIN_BET,
-    diagOutput: null,      // set when user presses Copy DOM diagnostics
-    diagMsg:    null,      // transient copy feedback message
+    games:         new Map(),  // key → GameEntry
+    log:           [],
+    tracking:      false,
+    parseOk:       null,       // null=not tried, true=ok, false=failed
+    parseNote:     '',
+    minBet:        DEFAULT_MIN_BET,
+    diagOutput:    null,       // set when user presses Copy DOM diagnostics
+    diagMsg:       null,       // transient copy feedback message
+    statusEnabled: false,      // status checks opt-in (off by default)
+    apiKey:        '',         // user-entered API key for TM/VM (never logged)
+    dwHistOpen:    false,      // disappearance watch history panel open/closed
   };
 
   /* ============================ 3. PARSING ============================ */
@@ -866,12 +918,24 @@
 
   function scanLobby(isInitial) {
     const result = parseRRLobby();
-    State.parseOk = result.ok;
+    State.parseOk   = result.ok;
     State.parseNote = result.reason;
-    if (!result.ok) { UI.render(); return; }
     const now = Date.now();
-    processGames(result.games, isInitial, now);
-    injectLobbyTimers(now);
+    if (result.ok) {
+      processGames(result.games, isInitial, now);
+      injectLobbyTimers(now);
+      /* Enrich with firstSeen/lastSeen from State before feeding engine */
+      const enriched = result.games.map(function (g) {
+        const st = State.games.get(g.key);
+        return { gameId: g.gameId, playerId: g.playerId, playerName: g.playerName,
+                 bet: g.bet, firstSeen: st ? st.firstSeen : null, lastSeen: now };
+      });
+      DisappearanceEngine.observeSnapshot(enriched, now, true);
+    } else {
+      DisappearanceEngine.observeSnapshot([], now, false);
+    }
+    DisappearanceEngine.tick(now);
+    StatusChecker.tick(now);
     UI.render();
   }
 
@@ -902,6 +966,7 @@
   function startTracking() {
     if (State.tracking) return;
     State.tracking = true;
+    DisappearanceEngine.resume();
     logEvent('TRACKING_RESUMED');
     scanLobby(true);
     _observer = new MutationObserver(function (mutations) {
@@ -937,6 +1002,7 @@
     if (_renderTimer) { clearInterval(_renderTimer); _renderTimer = null; }
     if (_tickTimer) { clearInterval(_tickTimer); _tickTimer = null; }
     removeInlineTimers();
+    DisappearanceEngine.resetOrSuspend();
     UI.render();
   }
 
@@ -1033,13 +1099,422 @@
         if (el) el.textContent = formatCountdown(g.firstSeen, now);
       });
     } catch (e) { /* defensive */ }
-    /* Update inline lobby row timers */
     updateLobbyTimers(now);
-    /* Re-inject for any new rows that appeared since last scan */
     injectLobbyTimers(now);
+    DisappearanceEngine.tick(now);
+    StatusChecker.tick(now);
   }
 
-  /* ============================ 8. UI ============================ */
+  /* ============================ 8. DISAPPEARANCE ENGINE ============================ */
+  /*
+   * Self-contained state machine.  No DOM access, no network calls.
+   * All time parameters are explicit timestamps so tests can use a fake clock.
+   *
+   * Priority (0–100) is a heuristic investigation score, not a win probability.
+   * Human-readable reason strings are built alongside every score update.
+   *
+   * States
+   *   WATCHING  — game is currently visible in the lobby
+   *   CANDIDATE — absent from 1 valid scan; awaiting confirmation
+   *   CONFIRMED — absent from 2+ valid scans; status checks scheduled
+   *   HOSPITAL  — confirmed disappeared, host found in hospital (suppressed)
+   *   MOOT      — game reappeared after candidate/confirmed
+   *   EXPIRED   — confirmed >30 min ago; moved to history
+   *   DISMISSED — user dismissed
+   */
+  const DisappearanceEngine = (function () {
+    let _watches   = new Map();  /* gameId → entry */
+    let _history   = [];
+    let _absCount  = new Map();  /* gameId → consecutive valid-scan absent count */
+    let _suspended = false;
+
+    function _makeEntry(g) {
+      return {
+        gameId:        g.gameId,
+        playerId:      g.playerId,
+        playerName:    g.playerName,
+        bet:           g.bet != null ? g.bet : null,
+        firstSeen:     g.firstSeen != null ? g.firstSeen : null,
+        lastSeen:      g.lastSeen  != null ? g.lastSeen  : null,
+        state:         'WATCHING',
+        stateReason:   'Game observed in lobby',
+        candidateTs:   null,
+        confirmedTs:   null,
+        statusChecks:  DE_STATUS_OFFSETS.map(function (o) {
+          return { offset: o, scheduledAt: null, result: null, error: null, ts: null };
+        }),
+        latestStatus:  null,
+        latestStatusTs:null,
+        priority:      0,
+        priorityReason:'',
+        outcome:       null,
+      };
+    }
+
+    function _scheduleChecks(entry, ts) {
+      entry.statusChecks = DE_STATUS_OFFSETS.map(function (o) {
+        return { offset: o, scheduledAt: ts + o, result: null, error: null, ts: null };
+      });
+    }
+
+    function _computePriority(entry, now) {
+      if (entry.state === 'HOSPITAL') return { score: 0, reason: 'Host in hospital — not actionable' };
+      if (!entry.confirmedTs)         return { score: 0, reason: '' };
+
+      const base   = (entry.firstSeen === null) ? 35 : 50;
+      const checks = entry.statusChecks.filter(function (c) { return c.result && c.result !== 'ERROR'; });
+      const okays  = checks.filter(function (c) { return c.result === 'Okay'; });
+      const ok15   = entry.statusChecks.find(function (c) { return c.offset === 15000 && c.result === 'Okay'; });
+
+      let bonus = 0;
+      var reasons = [];
+      if (ok15)          { bonus += 20; reasons.push('Okay at +15 s'); }
+      else if (okays.length) { bonus += 10; reasons.push('Okay status seen'); }
+      if (okays.length > 1) {
+        bonus += Math.min(5 * (okays.length - 1), 10);
+        reasons.push('Confirmed Okay ×' + okays.length);
+      }
+
+      let score = Math.min(base + bonus, 90);
+
+      if (!checks.length)       score = Math.min(score, 60);   /* no status data */
+      else if (!okays.length)   score = Math.min(score, 50);   /* all non-Okay */
+
+      /* Age decay */
+      const elapsed = now - entry.confirmedTs;
+      if (elapsed >= DE_DECAY_END_MS) {
+        score = DE_DECAY_FLOOR;
+      } else if (elapsed > DE_DECAY_START_MS) {
+        const frac = (elapsed - DE_DECAY_START_MS) / (DE_DECAY_END_MS - DE_DECAY_START_MS);
+        score = Math.round(score * (1 - frac) + DE_DECAY_FLOOR * frac);
+      }
+      score = Math.max(DE_DECAY_FLOOR, Math.min(100, score));
+
+      const ageMin = Math.round(elapsed / 60000);
+      const ageStr = ageMin > 0 ? '; ' + ageMin + 'm ago' : '';
+      const reasonStr = reasons.length
+        ? reasons.join('; ') + ageStr
+        : (checks.length ? 'Status checked — not Okay' : 'Status unknown') + ageStr;
+
+      return { score: score, reason: reasonStr };
+    }
+
+    function _archiveIfDone(entry) {
+      var terminal = entry.state === 'EXPIRED' || entry.state === 'DISMISSED' || entry.state === 'MOOT';
+      if (!terminal) return;
+      _history.unshift(Object.assign({}, entry));
+      if (_history.length > DE_HISTORY_MAX) _history.pop();
+      _watches.delete(entry.gameId);
+      _absCount.delete(entry.gameId);
+    }
+
+    /* ── public interface ── */
+
+    function observeSnapshot(games, timestamp, scanValid) {
+      if (_suspended) return;
+
+      var presentIds = new Set();
+      for (var i = 0; i < games.length; i++) {
+        if (games[i].gameId) presentIds.add(games[i].gameId);
+      }
+
+      /* Register new games / update existing ones */
+      for (var j = 0; j < games.length; j++) {
+        var g = games[j];
+        if (!g.gameId) continue;
+        var ex = _watches.get(g.gameId);
+        if (!ex) {
+          var entry = _makeEntry(g);
+          entry.lastSeen = timestamp;
+          _watches.set(g.gameId, entry);
+          _absCount.delete(g.gameId);
+        } else {
+          /* Game (re)appeared — cancel disappearance candidate if pending */
+          if (ex.state === 'CANDIDATE' || ex.state === 'CONFIRMED') {
+            ex.state       = 'MOOT';
+            ex.stateReason = 'Game reappeared';
+            _archiveIfDone(ex);
+          } else {
+            ex.lastSeen    = timestamp;
+            ex.playerName  = g.playerName;
+            ex.bet         = g.bet;
+            _absCount.delete(g.gameId);
+          }
+        }
+      }
+
+      /* Invalid scan: hold state, don't advance disappearance */
+      if (!scanValid) return;
+
+      /* Check for absent games */
+      _watches.forEach(function (entry, gameId) {
+        if (entry.state !== 'WATCHING' && entry.state !== 'CANDIDATE') return;
+        if (presentIds.has(gameId)) return; /* still present */
+
+        var abs = (_absCount.get(gameId) || 0) + 1;
+        _absCount.set(gameId, abs);
+
+        if (abs === 1 && entry.state === 'WATCHING') {
+          entry.state       = 'CANDIDATE';
+          entry.stateReason = 'Absent from 1 valid scan — awaiting confirmation';
+          entry.candidateTs = timestamp;
+        } else if (abs >= 2 && entry.state === 'CANDIDATE') {
+          entry.state       = 'CONFIRMED';
+          entry.stateReason = 'Confirmed absent across ' + abs + ' valid scans';
+          entry.confirmedTs = timestamp;
+          _scheduleChecks(entry, timestamp);
+          var pr = _computePriority(entry, timestamp);
+          entry.priority       = pr.score;
+          entry.priorityReason = pr.reason;
+        }
+      });
+
+      /* Expire old confirmed entries */
+      var now = timestamp;
+      _watches.forEach(function (entry) {
+        if ((entry.state === 'CONFIRMED' || entry.state === 'HOSPITAL') &&
+            entry.confirmedTs && (now - entry.confirmedTs) >= DE_EXPIRE_MS) {
+          entry.state       = 'EXPIRED';
+          entry.stateReason = 'Expired after 30 minutes';
+          _archiveIfDone(entry);
+        }
+      });
+    }
+
+    function observePlayerStatus(playerId, status, timestamp) {
+      _watches.forEach(function (entry) {
+        if (entry.playerId !== String(playerId)) return;
+        if (entry.state !== 'CONFIRMED' && entry.state !== 'HOSPITAL') return;
+
+        /* Fill the most overdue unfilled slot */
+        var bestSlot = null, bestDiff = Infinity;
+        for (var i = 0; i < entry.statusChecks.length; i++) {
+          var slot = entry.statusChecks[i];
+          if (slot.result !== null) continue;
+          if (slot.scheduledAt === null) continue;
+          var diff = Math.abs(timestamp - slot.scheduledAt);
+          if (diff < bestDiff) { bestDiff = diff; bestSlot = slot; }
+        }
+        if (bestSlot) { bestSlot.result = status; bestSlot.ts = timestamp; }
+
+        /* Always track latest */
+        if (entry.latestStatusTs === null || timestamp >= entry.latestStatusTs) {
+          entry.latestStatus   = status;
+          entry.latestStatusTs = timestamp;
+        }
+
+        /* Hospital suppression */
+        if (status === 'Hospital') {
+          entry.state       = 'HOSPITAL';
+          entry.stateReason = 'Host in hospital — not actionable';
+        }
+
+        /* Recompute priority */
+        var pr = _computePriority(entry, timestamp);
+        entry.priority       = pr.score;
+        entry.priorityReason = pr.reason;
+      });
+    }
+
+    function tick(timestamp) {
+      if (_suspended) return;
+      _watches.forEach(function (entry) {
+        if (entry.state !== 'CONFIRMED') return;
+        var pr = _computePriority(entry, timestamp);
+        entry.priority       = pr.score;
+        entry.priorityReason = pr.reason;
+      });
+    }
+
+    function getDueChecks(timestamp) {
+      var due = [];
+      _watches.forEach(function (entry) {
+        if (entry.state !== 'CONFIRMED') return;
+        if (!entry.playerId || !/^\d+$/.test(entry.playerId)) return;
+        for (var i = 0; i < entry.statusChecks.length; i++) {
+          var slot = entry.statusChecks[i];
+          if (slot.result !== null) continue;
+          if (slot.scheduledAt === null) continue;
+          if (timestamp >= slot.scheduledAt) {
+            due.push({ gameId: entry.gameId, playerId: entry.playerId,
+                       offset: slot.offset, slot: slot });
+            break; /* one per entry */
+          }
+        }
+      });
+      return due;
+    }
+
+    function getCandidates() {
+      var out = [];
+      _watches.forEach(function (entry) {
+        if (entry.state === 'CONFIRMED' || entry.state === 'HOSPITAL') {
+          out.push(Object.assign({}, entry));
+        }
+      });
+      out.sort(function (a, b) {
+        return b.priority - a.priority || (b.confirmedTs || 0) - (a.confirmedTs || 0);
+      });
+      return out;
+    }
+
+    function getHistory() { return _history.slice(); }
+
+    function resetOrSuspend() {
+      _suspended = true;
+      /* Freeze state — do not clear confirmed candidates */
+    }
+
+    function resume() {
+      _suspended = false;
+      /* Reset unstable candidates to avoid false positives after suspension */
+      _watches.forEach(function (entry) {
+        if (entry.state === 'CANDIDATE') {
+          entry.state       = 'WATCHING';
+          entry.stateReason = 'Reset after page suspension';
+          entry.candidateTs = null;
+        }
+      });
+      _absCount.clear();
+    }
+
+    function setOutcome(gameId, outcome) {
+      var entry = _watches.get(gameId);
+      if (entry) { entry.outcome = outcome; return; }
+      for (var i = 0; i < _history.length; i++) {
+        if (_history[i].gameId === gameId) { _history[i].outcome = outcome; return; }
+      }
+    }
+
+    function dismiss(gameId) {
+      var entry = _watches.get(gameId);
+      if (!entry) return;
+      entry.state       = 'DISMISSED';
+      entry.stateReason = 'Dismissed by user';
+      _archiveIfDone(entry);
+    }
+
+    function _getWatches() { return _watches; } /* test-only */
+    function _reset() {                          /* test-only */
+      _watches.clear(); _history = []; _absCount.clear(); _suspended = false;
+    }
+
+    return {
+      observeSnapshot, observePlayerStatus, tick, getDueChecks,
+      getCandidates, getHistory, resetOrSuspend, resume,
+      setOutcome, dismiss, _getWatches, _reset,
+    };
+  })();
+
+  /* ============================ 9. STATUS CHECKER ============================ */
+  /*
+   * Rate-limited scheduler for Torn API status checks.
+   * Calls DisappearanceEngine.observePlayerStatus() on success.
+   * All network calls are opt-in (State.statusEnabled) and keyed (State.apiKey
+   * or PDA-injected key).  A key is never written to any log, DOM attribute,
+   * or console output.
+   */
+  const StatusChecker = (function () {
+    let _inFlight = false;
+    let _lastAt   = 0;
+
+    function _effectiveKey() {
+      /* PDA replaces DE_PDA_KEY at install time; in TM/VM user enters key in UI */
+      if (DE_PDA_KEY.indexOf('#') === -1) return DE_PDA_KEY; /* PDA injected */
+      if (State.apiKey && State.apiKey.length >= 8 &&
+          State.apiKey.indexOf('#') === -1) return State.apiKey;
+      return null;
+    }
+
+    function _parseResp(text, cb) {
+      try {
+        var json = JSON.parse(text);
+        /* v2: { profile: { status: { state } } }
+           alt: { basic: { status: { state } } }  or v1: { status: { state } } */
+        var state =
+          (json.profile && json.profile.status && json.profile.status.state) ||
+          (json.basic   && json.basic.status   && json.basic.status.state)   ||
+          (json.status  && json.status.state)   ||
+          null;
+        if (!state) {
+          var apiErr = json.error ? (json.error.error || String(json.error)) : 'No state in response';
+          cb(null, apiErr); return;
+        }
+        cb(state, null);
+      } catch (e) { cb(null, 'Parse error'); }
+    }
+
+    function _doFetch(playerId, key, cb) {
+      var url = 'https://api.torn.com/v2/user/' + encodeURIComponent(playerId) +
+                '/basic?key=' + encodeURIComponent(key);
+      if (typeof GM_xmlhttpRequest === 'function') {
+        GM_xmlhttpRequest({
+          method: 'GET', url: url, timeout: DE_TIMEOUT_MS,
+          onload:   function (r) {
+            if (r.status !== 200) { cb(null, 'HTTP ' + r.status); return; }
+            _parseResp(r.responseText, cb);
+          },
+          onerror:   function () { cb(null, 'Network error'); },
+          ontimeout: function () { cb(null, 'Timeout'); },
+        });
+      } else if (typeof PDA_httpGet === 'function') {
+        try {
+          PDA_httpGet(url, function (data, status) {
+            if (status !== 200) { cb(null, 'HTTP ' + status); return; }
+            _parseResp(data, cb);
+          });
+        } catch (e) { cb(null, 'PDA_httpGet error'); }
+      } else {
+        var ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+        var tid  = ctrl ? setTimeout(function () { ctrl.abort(); }, DE_TIMEOUT_MS) : null;
+        fetch(url, ctrl ? { signal: ctrl.signal } : {})
+          .then(function (r) {
+            clearTimeout(tid);
+            if (!r.ok) { cb(null, 'HTTP ' + r.status); return Promise.reject(null); }
+            return r.text();
+          })
+          .then(function (t) { _parseResp(t, cb); })
+          .catch(function (e) { if (e) { clearTimeout(tid); cb(null, 'Fetch error'); } });
+      }
+    }
+
+    function tick(now) {
+      if (!State.statusEnabled) return;
+      if (_inFlight) return;
+      var key = _effectiveKey();
+      if (!key) return;
+      if (now - _lastAt < DE_RATE_MS) return;
+
+      var due = DisappearanceEngine.getDueChecks(now);
+      if (!due.length) return;
+
+      var item = due[0];
+      _inFlight = true;
+      _lastAt   = now;
+
+      _doFetch(item.playerId, key, function (status, err) {
+        _inFlight = false;
+        var ts = Date.now();
+        if (status) {
+          DisappearanceEngine.observePlayerStatus(item.playerId, status, ts);
+        } else {
+          /* Mark slot errored so it is not re-queued */
+          item.slot.result = 'ERROR';
+          item.slot.error  = err || 'Unknown';
+          item.slot.ts     = ts;
+        }
+        DisappearanceEngine.tick(ts);
+        UI.render();
+      });
+    }
+
+    function canCheck() { return State.statusEnabled && !!_effectiveKey(); }
+    function _parseRespTest(text, cb) { _parseResp(text, cb); } /* test-only */
+
+    return { tick, canCheck, _parseRespTest };
+  })();
+
+  /* ============================ 10. UI ============================ */
   const UI = (function () {
     let host = null, shadow = null, _open = false;
     let $fab, $ov, $tgl, $cls, $bd;
@@ -1076,6 +1551,40 @@
       '.cfg{padding:6px 0 3px;border-top:1px solid #1e1030;margin-top:4px;font-size:11px;color:#6a4a80;display:flex;align-items:center;gap:6px;flex-wrap:wrap}',
       '.cfg input{flex:1;min-width:90px;max-width:150px;padding:4px 7px;border-radius:5px;border:1px solid #3a1a5a;background:#080410;color:#ddd0f0;font:11px inherit}',
       '.lbtn{margin-top:5px;padding:5px 10px;border-radius:6px;border:1px solid #3a1a5a;background:#100820;color:#8060a0;font-size:11px;touch-action:manipulation}',
+      /* disappearance watch */
+      '.dws{margin-top:8px;border-top:1px solid #2a1040;padding-top:6px}',
+      '.dwsh{font-size:11px;font-weight:700;color:#c080f0;margin-bottom:4px;display:flex;align-items:center;gap:5px}',
+      '.dwsc{font-size:10px;background:#3a1a5a;border-radius:8px;padding:1px 6px;color:#d0a0f0}',
+      '.dwc{padding:6px 8px;margin-bottom:4px;border-radius:7px;border:1px solid #3a2050;background:#0e0620}',
+      '.dwc.act{border-color:#6a2030;background:#160810}',
+      '.dwc.sup{opacity:.55;border-color:#1a1a3a}',
+      '.dwp{display:inline-block;min-width:26px;height:16px;border-radius:8px;text-align:center;font-size:9px;font-weight:700;line-height:16px;padding:0 4px;margin-right:4px;background:#2a1040;color:#c080f0}',
+      '.dwp.hi{background:#4a1020;color:#f08080}',
+      '.dwn{font-weight:600;color:#c080f0;font-size:12px}',
+      '.dwid{font-size:10px;color:#4a3060;margin-left:3px}',
+      '.dwx{font-size:11px;color:#8060a0;margin-top:2px}',
+      '.dwst{font-size:10px;color:#6a4a7a;margin-top:1px}',
+      '.dwst.ok{color:#5cb85c}',
+      '.dwst.ho{color:#c09040}',
+      '.dwrsn{font-size:10px;color:#a070c0;margin-top:2px;font-style:italic}',
+      '.dwbr{display:flex;gap:4px;margin-top:5px;flex-wrap:wrap}',
+      '.dwbr a,.dwbr button{padding:3px 8px;border-radius:4px;font-size:10px;font-weight:600;text-decoration:none;border:1px solid #3a1a5a;background:#0c0420;color:#9070b0;cursor:pointer;font-family:inherit;touch-action:manipulation;-webkit-tap-highlight-color:transparent}',
+      '.dwbr a.atk{border-color:#4a1a2a;color:#c06070}',
+      '.dwbr .dis{opacity:.35;pointer-events:none}',
+      '.dwbr .dsm{color:#4a3060}',
+      '.dwbr .oc{color:#6a4a60}',
+      '.dwbr .oc.sel{border-color:#5a3060;color:#c080f0}',
+      '.dw-cfg{margin-top:5px;font-size:10px;color:#6a4a80;display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding-top:5px;border-top:1px solid #1e1030}',
+      '.dw-cfg label{display:flex;align-items:center;gap:4px;cursor:pointer}',
+      '.dw-cfg input[type=checkbox]{width:13px;height:13px;accent-color:#8040c0;cursor:pointer}',
+      '.dw-cfg input[type=password]{max-width:130px;padding:3px 6px;border-radius:4px;border:1px solid #3a1a5a;background:#080410;color:#ddd0f0;font:10px inherit}',
+      '.dw-hist{margin-top:4px;padding-top:4px;border-top:1px solid #1e1030;font-size:10px;color:#5a4070}',
+      '.dw-hist-item{padding:2px 0;display:flex;gap:5px;align-items:baseline;flex-wrap:wrap}',
+      '.dw-hist-nm{color:#6a5070}',
+      '.dw-hist-oc{color:#5cb85c}',
+      '.dw-hist-oc.L{color:#c06070}',
+      '.dw-hist-oc.T{color:#6070a0}',
+      '.dw-empty{font-size:11px;color:#3a2050;padding:8px 0;text-align:center}',
       /* diagnostic output panel */
       '.dg-wrap{margin-top:7px;border-top:1px solid #2a1040;padding-top:5px}',
       '.dg-hd{display:flex;align-items:center;justify-content:space-between;font-size:11px;color:#8060b0;margin-bottom:3px}',
@@ -1146,6 +1655,112 @@
         }
       }
 
+      /* ── Disappearance Watch ── */
+      var dwCands = DisappearanceEngine.getCandidates();
+      var dwHist  = DisappearanceEngine.getHistory();
+      html += '<div class="dws">';
+      html += '<div class="dwsh">\uD83D\uDC41 Disappearance Watch';
+      if (dwCands.length) html += '<span class="dwsc">' + dwCands.length + '</span>';
+      html += '</div>';
+
+      if (!dwCands.length) {
+        html += '<div class="dw-empty">No confirmed disappearances yet</div>';
+      } else {
+        for (var di = 0; di < dwCands.length; di++) {
+          var dc = dwCands[di];
+          var isAct = dc.priority >= 60;
+          var isSup = dc.state === 'HOSPITAL';
+          html += '<div class="dwc' + (isSup ? ' sup' : isAct ? ' act' : '') + '">';
+          /* Name + priority badge */
+          html += '<div>';
+          html += '<span class="dwp' + (isAct ? ' hi' : '') + '">' + dc.priority + '</span>';
+          html += '<span class="dwn">' + esc(dc.playerName) + '</span>';
+          html += '<span class="dwid">#' + esc(dc.playerId) + '</span>';
+          html += '</div>';
+          /* Bet + game */
+          html += '<div class="dwx">Bet:&nbsp;' + esc(fmtBet(dc.bet));
+          if (dc.gameId) html += '&nbsp;&middot;&nbsp;Game:&nbsp;' + esc(dc.gameId);
+          html += '</div>';
+          /* Time info */
+          var dwElapsed = dc.confirmedTs ? formatAge(dc.confirmedTs, now) : '?';
+          var dwObs     = formatAge(dc.firstSeen, now);
+          html += '<div class="dwx">Gone:&nbsp;' + esc(dwElapsed) + '&nbsp;&middot;&nbsp;Observed:&nbsp;' + esc(dwObs) + '</div>';
+          /* Status */
+          var dwStCls = dc.latestStatus === 'Okay' ? 'ok' : dc.latestStatus === 'Hospital' ? 'ho' : '';
+          html += '<div class="dwst ' + dwStCls + '">';
+          if (!State.statusEnabled) {
+            html += 'Status: checks disabled';
+          } else if (dc.latestStatus) {
+            var dwStAge = dc.latestStatusTs ? ('&nbsp;(' + esc(formatAge(dc.latestStatusTs, now)) + ' ago)') : '';
+            html += 'Status:&nbsp;<strong>' + esc(dc.latestStatus) + '</strong>' + dwStAge;
+          } else if (StatusChecker.canCheck()) {
+            html += 'Status: checking\u2026';
+          } else {
+            html += 'Status: no API key';
+          }
+          html += '</div>';
+          /* Priority reason */
+          if (dc.priorityReason) {
+            html += '<div class="dwrsn">' + esc(dc.priorityReason) + '</div>';
+          }
+          /* Action row */
+          var dwProfURL = tornProfileURL(dc.playerId);
+          var dwAtkURL  = tornAttackURL(dc.playerId);
+          html += '<div class="dwbr">';
+          html += '<a' + (dwProfURL ? ' href="' + esc(dwProfURL) + '"' : '') +
+                  ' target="_blank" rel="noopener noreferrer"' +
+                  ' class="prf' + (dwProfURL ? '' : ' dis') + '">Profile</a>';
+          html += '<a' + (dwAtkURL ? ' href="' + esc(dwAtkURL) + '"' : '') +
+                  ' target="_blank" rel="noopener noreferrer"' +
+                  ' class="atk' + (dwAtkURL ? '' : ' dis') + '">Attack</a>';
+          html += '<button class="dsm" data-dw-dismiss="' + esc(dc.gameId) + '">Dismiss</button>';
+          var ocLabels = [['Won','W'],['Lost','L'],['Timeout','T'],['Unknown','?']];
+          for (var oi = 0; oi < ocLabels.length; oi++) {
+            var oLabel = ocLabels[oi][0], oShort = ocLabels[oi][1];
+            var oSel   = dc.outcome === oLabel ? ' sel' : '';
+            html += '<button class="oc' + oSel + '" data-dw-outcome="' + esc(dc.gameId) +
+                    '" data-dw-label="' + oLabel + '">' + oShort + '</button>';
+          }
+          html += '</div>';
+          html += '</div>'; /* /dwc */
+        }
+      }
+
+      /* Status check config */
+      html += '<div class="dw-cfg">';
+      html += '<label><input type="checkbox" id="rrmt-sc-on"' +
+              (State.statusEnabled ? ' checked' : '') + '>&nbsp;Status checks</label>';
+      var pdaKeyLive = DE_PDA_KEY.indexOf('#') === -1;
+      if (State.statusEnabled && !pdaKeyLive) {
+        html += '<input type="password" id="rrmt-sc-key" placeholder="API key" value=""' +
+                ' title="Enter your Torn API key (read-only)">';
+      } else if (State.statusEnabled && pdaKeyLive) {
+        html += '<span style="color:#5cb85c;font-size:9px">\u2713 PDA key active</span>';
+      }
+      html += '</div>';
+
+      /* Recent history */
+      if (dwHist.length) {
+        html += '<div class="dw-hist"><strong>' + dwHist.length + ' in history</strong>';
+        if (State.dwHistOpen) {
+          var showH = dwHist.slice(0, 10);
+          for (var hi = 0; hi < showH.length; hi++) {
+            var hc = showH[hi];
+            var ocCls = hc.outcome === 'Won' ? '' : hc.outcome === 'Lost' ? ' L' : ' T';
+            html += '<div class="dw-hist-item">';
+            html += '<span class="dw-hist-nm">' + esc(hc.playerName) + ' (' + esc(hc.gameId) + ')</span>';
+            html += '<span>' + esc(hc.state) + '</span>';
+            if (hc.outcome) html += '<span class="dw-hist-oc' + ocCls + '">' + esc(hc.outcome) + '</span>';
+            html += '</div>';
+          }
+        }
+        html += '&nbsp;<button class="lbtn" id="rrmt-dw-hist-tgl">' +
+                (State.dwHistOpen ? '\u25B2 Hide' : '\u25BC History') + '</button>';
+        html += '</div>';
+      }
+
+      html += '</div>'; /* /dws */
+
       html += '<div class="cfg"><label>Min bet:&nbsp;<input id="rrmt-mb" type="text" value="' + esc(fmtBet(State.minBet)) + '" placeholder="e.g. 200M"></label></div>';
       html += '<button class="lbtn" id="rrmt-lb">Copy log (last 50)</button>';
       html += '&nbsp;<button class="lbtn" id="rrmt-diag">Copy DOM diagnostics</button>';
@@ -1178,6 +1793,34 @@
           render();
         });
       }
+
+      /* Disappearance Watch event listeners */
+      shadow.querySelectorAll('[data-dw-dismiss]').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          DisappearanceEngine.dismiss(this.getAttribute('data-dw-dismiss'));
+          render();
+        });
+      });
+      shadow.querySelectorAll('[data-dw-outcome]').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          DisappearanceEngine.setOutcome(this.getAttribute('data-dw-outcome'),
+                                         this.getAttribute('data-dw-label'));
+          render();
+        });
+      });
+      const scOnEl = shadow.getElementById('rrmt-sc-on');
+      if (scOnEl) scOnEl.addEventListener('change', function () {
+        State.statusEnabled = this.checked; render();
+      });
+      const scKeyEl = shadow.getElementById('rrmt-sc-key');
+      if (scKeyEl) scKeyEl.addEventListener('change', function () {
+        /* Store key in State — never log it */
+        State.apiKey = this.value.trim();
+      });
+      const dwHistTgl = shadow.getElementById('rrmt-dw-hist-tgl');
+      if (dwHistTgl) dwHistTgl.addEventListener('click', function () {
+        State.dwHistOpen = !State.dwHistOpen; render();
+      });
 
       const mbEl = shadow.getElementById('rrmt-mb');
       if (mbEl) mbEl.addEventListener('change', function () {
@@ -1289,8 +1932,10 @@
   document.addEventListener('visibilitychange', function () {
     if (document.hidden) {
       if (_tickTimer) { clearInterval(_tickTimer); _tickTimer = null; }
-    } else if (State.tracking && !_tickTimer) {
-      _tickTimer = setInterval(tickTimers, 1000);
+      DisappearanceEngine.resetOrSuspend();
+    } else {
+      DisappearanceEngine.resume();
+      if (State.tracking && !_tickTimer) _tickTimer = setInterval(tickTimers, 1000);
     }
   }, { passive: true });
 
@@ -1312,6 +1957,7 @@
         injectLobbyTimers, updateLobbyTimers, removeInlineTimers, tickTimers,
         State, UI,
         UI_LABEL,
+        DisappearanceEngine, StatusChecker,
       };
     }
   }
