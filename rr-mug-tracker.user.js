@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RR Mug Tracker
 // @namespace    fatboy.torn
-// @version      0.1.4
+// @version      0.1.5
 // @description  Russian Roulette lobby tracker for Torn PDA (iOS): observe active games, log events, show elapsed time.
 // @author       FATBOY [572123]
 // @match        https://www.torn.com/page.php*
@@ -10,7 +10,20 @@
 // ==/UserScript==
 
 /*
- * RR Mug Tracker v0.1.4 — implement confirmed live Torn PDA lobby structure.
+ * RR Mug Tracker v0.1.5 — fix player name extraction.
+ * No API calls, no auto-play, no attacks, no mugging.
+ *
+ * v0.1.5 changes:
+ *   - parseRRLobby() name extraction: profile link direct text nodes are now
+ *     the PRIMARY source (via getPlayerName). honorWrap.textContent is the
+ *     fallback only when the link has no readable text.
+ *     Root cause: another userscript injects battle-stat estimates ("2.4b",
+ *     "26k") into the honorWrap element, polluting its textContent.  The
+ *     profile link itself is always clean.
+ *   - Comment in parseRRLobby updated to reflect confirmed name order.
+ *   - Suite I added: 4 regression tests for the battle-stat injection pattern.
+ *
+ * v0.1.4 — implement confirmed live Torn PDA lobby structure.
  * No API calls, no auto-play, no attacks, no mugging.
  *
  * v0.1.4 changes:
@@ -95,7 +108,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '0.1.4';
+  const VERSION = '0.1.5';
   if (window.top !== window.self) return;
 
   /* isRRPage accepts optional (pn, qs) args for test-harness use */
@@ -307,7 +320,7 @@
    * Flow: section → rowsWrap → direct children (game rows).
    * Game ID : row.id (numeric)  →  button[data-id]  →  link-href ?game=N.
    * Player  : a[href*="/profiles.php?XID="] inside the row.
-   * Name    : [class*="honorWrap"] inside row, or direct text nodes of link.
+   * Name    : direct text nodes of profile link (getPlayerName) → honorWrap fallback.
    * Bet     : parseBet(row.textContent) — scoped per row, no cross-row leakage.
    */
   function parseRRLobby(root) {
@@ -350,13 +363,17 @@
       if (!pidMatch) continue;
       const pid = pidMatch[1];
 
-      /* Name: try honorWrap first (confirmed Torn structure), then text nodes */
-      let name = '';
-      try {
-        const honorEl = row.querySelector('[class*="honorWrap"]');
-        if (honorEl) name = honorEl.textContent.replace(/\s+/g, ' ').trim();
-      } catch (e) { /* skip */ }
-      if (!name) name = getPlayerName(link);
+      /* Name: profile link direct text nodes first (always clean); fall back to
+         honorWrap only if the link yields nothing.  Another userscript injects
+         battle-stat estimates ("2.4b", "26k") into honorWrap, so honorWrap
+         textContent cannot be used as the primary source. */
+      let name = getPlayerName(link);
+      if (!name) {
+        try {
+          const honorEl = row.querySelector('[class*="honorWrap"]');
+          if (honorEl) name = honorEl.textContent.replace(/\s+/g, ' ').trim();
+        } catch (e) { /* skip */ }
+      }
       if (!name || UI_LABEL.test(name)) continue;
 
       const key = gameKey(gId, pid);
