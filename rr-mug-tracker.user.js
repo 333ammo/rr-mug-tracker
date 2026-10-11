@@ -1,16 +1,41 @@
 // ==UserScript==
 // @name         RR Mug Tracker
 // @namespace    fatboy.torn
-// @version      0.3.1
+// @version      0.3.2
 // @description  Russian Roulette lobby tracker with disappearance-watch intelligence for Torn PDA (iOS) and desktop.
 // @author       FATBOY [572123]
 // @match        https://www.torn.com/page.php*
 // @run-at       document-end
 // @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
 // @connect      api.torn.com
 // ==/UserScript==
 
 /*
+ * RR Mug Tracker v0.3.2 — persistent disappearance history.
+ *
+ * v0.3.2 changes:
+ *   - PersistenceStore: new module (section 9) persists DisappearanceEngine state across
+ *     page reloads, Torn PDA restarts and userscript restarts.
+ *     Storage: GM_getValue/GM_setValue (TM/VM/PDA) with localStorage fallback.
+ *     Schema: { version: 1, savedAt: ms, watches: [...], history: [...] }.
+ *     Probe verifies storage before first write.  Throttle: max 1 write per 5 s.
+ *     Key: "rrmt_de_store".  API keys/credentials are never stored.
+ *   - History limit raised from 50 to 2,000 entries.
+ *   - DisappearanceEngine: _dirty flag; exportState(), importState(), importFromBackup().
+ *     importState safety: CANDIDATE → WATCHING on reload; WATCHING entries older than
+ *     DE_EXPIRE_MS (30 min save-age) dropped to prevent false positives; CONFIRMED and
+ *     HOSPITAL preserved; EXPIRED/DISMISSED/MOOT entries load as history only.
+ *     _absCount cleared on import (no stale absent counts carried over).
+ *   - Export History buttons: JSON (full lossless dataset) and CSV (one row per game).
+ *     Download attempted first; falls back to textarea display for Torn PDA.
+ *   - Import JSON: paste-and-apply pane with validation and gameId deduplication.
+ *   - History section: paginated (DE_HIST_PAGE_SIZE = 20), shows accurate total count.
+ *   - Metadata: @grant GM_getValue, @grant GM_setValue added.
+ *   - Suite S added: 20 regression tests (S1–S20) covering persistence, export/import.
+ *   - All 122 v0.3.1 regression tests preserved.
+ *
  * RR Mug Tracker v0.3.1 — correctness hotfix for Phase 2B.
  *
  * v0.3.1 fixes:
@@ -239,7 +264,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '0.3.1';
+  const VERSION = '0.3.2';
   if (window.top !== window.self) return;
 
   /* isRRPage accepts optional (pn, qs) args for test-harness use */
@@ -270,11 +295,15 @@
   const DE_DECAY_END_MS   = 30 * 60 * 1000;
   const DE_DECAY_FLOOR    = 5;
   const DE_STATUS_OFFSETS = [0, 15000, 30000, 45000, 60000, 90000];
-  const DE_HISTORY_MAX    = 50;
+  const DE_HISTORY_MAX          = 2000;   /* raised from 50 for 12–24 h experiments */
+  const DE_HIST_PAGE_SIZE       = 20;
   const DE_RATE_MS              = 2500;   /* max ~24 status requests / min */
   const DE_TIMEOUT_MS           = 10000;
   const DE_PDA_KEY              = '###PDA-APIKEY###';  /* PDA replaces at install time */
   const DE_CONFIRM_DEBOUNCE_MS  = 800;    /* min ms between CANDIDATE and CONFIRMED */
+  const DE_STORE_KEY            = 'rrmt_de_store';
+  const DE_STORE_VERSION        = 1;
+  const DE_SAVE_THROTTLE_MS     = 5000;
 
   /* Profile-link texts that are UI chrome, not player names */
   const UI_LABEL = /^(view\s+profile\.?|premium\s+data|follow|unfollow|report|trade|send\s+message|send\s+gift|bounty|add\s+to\s+friend)$/i;
@@ -292,6 +321,11 @@
     statusEnabled: false,      // status checks opt-in (off by default)
     apiKey:        '',         // user-entered API key for TM/VM (never logged)
     dwHistOpen:    false,      // disappearance watch history panel open/closed
+    dwHistPage:    0,          // current history page (0-indexed)
+    dwImportOpen:  false,      // import JSON pane visible
+    dwImportError: '',         // last import error message
+    exportOutput:  null,       // fallback textarea content for export
+    exportOutputFn: '',        // filename hint for export display
   };
 
   /* ============================ 3. PARSING ============================ */
@@ -1120,6 +1154,10 @@
     injectLobbyTimers(now);
     DisappearanceEngine.tick(now);
     StatusChecker.tick(now);
+    if (DisappearanceEngine.isDirty()) {
+      PersistenceStore.save(now);
+      DisappearanceEngine.clearDirty();
+    }
   }
 
   /* ============================ 8. DISAPPEARANCE ENGINE ============================ */
@@ -1144,6 +1182,7 @@
     let _history   = [];
     let _absCount  = new Map();  /* gameId → consecutive valid-scan absent count */
     let _suspended = false;
+    let _dirty     = false;      /* set when state needs saving */
 
     function _makeEntry(g) {
       return {
@@ -1170,7 +1209,7 @@
 
     function _scheduleChecks(entry, ts) {
       entry.statusChecks = DE_STATUS_OFFSETS.map(function (o) {
-        return { offset: o, scheduledAt: ts + o, result: null, error: null, ts: null };
+        return { offset: o, scheduledAt: ts + o, result: null, error: null, ts: null, apiTs: null };
       });
     }
 
@@ -1229,10 +1268,13 @@
     function _archiveIfDone(entry) {
       var terminal = entry.state === 'EXPIRED' || entry.state === 'DISMISSED' || entry.state === 'MOOT';
       if (!terminal) return;
-      _history.unshift(Object.assign({}, entry));
+      _history.unshift(Object.assign({}, entry, {
+        statusChecks: entry.statusChecks.map(function (s) { return Object.assign({}, s); }),
+      }));
       if (_history.length > DE_HISTORY_MAX) _history.pop();
       _watches.delete(entry.gameId);
       _absCount.delete(entry.gameId);
+      _dirty = true;
     }
 
     /* ── public interface ── */
@@ -1285,6 +1327,7 @@
           entry.state       = 'CANDIDATE';
           entry.stateReason = 'Absent from 1 valid scan — awaiting confirmation';
           entry.candidateTs = timestamp;
+          _dirty = true;
         } else if (abs >= 2 && entry.state === 'CANDIDATE') {
           /* Require a real debounce interval — prevents rapid MutationObserver callbacks
              from confirming a game that may be in the middle of a React rerender */
@@ -1297,6 +1340,7 @@
             var pr = _computePriority(entry, timestamp);
             entry.priority       = pr.score;
             entry.priorityReason = pr.reason;
+            _dirty = true;
           }
         }
       });
@@ -1346,6 +1390,7 @@
         var pr = _computePriority(entry, timestamp);
         entry.priority       = pr.score;
         entry.priorityReason = pr.reason;
+        _dirty = true;
       });
     }
 
@@ -1406,6 +1451,7 @@
           entry.state       = 'WATCHING';
           entry.stateReason = 'Reset after page suspension';
           entry.candidateTs = null;
+          _dirty = true;
         }
       });
       _absCount.clear();
@@ -1413,9 +1459,9 @@
 
     function setOutcome(gameId, outcome) {
       var entry = _watches.get(gameId);
-      if (entry) { entry.outcome = outcome; return; }
+      if (entry) { entry.outcome = outcome; _dirty = true; return; }
       for (var i = 0; i < _history.length; i++) {
-        if (_history[i].gameId === gameId) { _history[i].outcome = outcome; return; }
+        if (_history[i].gameId === gameId) { _history[i].outcome = outcome; _dirty = true; return; }
       }
     }
 
@@ -1424,6 +1470,7 @@
       if (!entry) return;
       entry.state       = 'DISMISSED';
       entry.stateReason = 'Dismissed by user';
+      _dirty = true;
       _archiveIfDone(entry);
     }
 
@@ -1446,21 +1493,216 @@
       var pr = _computePriority(entry, ts);
       entry.priority       = pr.score;
       entry.priorityReason = pr.reason;
+      _dirty = true;
     }
+
+    function exportState() {
+      var watches = [];
+      _watches.forEach(function (entry) {
+        watches.push(Object.assign({}, entry, {
+          statusChecks: entry.statusChecks.map(function (s) { return Object.assign({}, s); }),
+        }));
+      });
+      return {
+        watches: watches,
+        history: _history.map(function (e) {
+          return Object.assign({}, e, {
+            statusChecks: Array.isArray(e.statusChecks)
+              ? e.statusChecks.map(function (s) { return Object.assign({}, s); }) : [],
+          });
+        }),
+      };
+    }
+
+    function importState(data) {
+      if (!data || !Array.isArray(data.watches) || !Array.isArray(data.history)) return false;
+      var savedAt = (data.savedAt && typeof data.savedAt === 'number') ? data.savedAt : 0;
+      var ageMs   = savedAt > 0 ? Math.max(0, Date.now() - savedAt) : Infinity;
+
+      for (var i = 0; i < data.watches.length; i++) {
+        var w = data.watches[i];
+        if (!w || !w.gameId) continue;
+        if (_watches.has(w.gameId)) continue;
+        var restored = Object.assign({}, w, {
+          statusChecks: Array.isArray(w.statusChecks)
+            ? w.statusChecks.map(function (s) { return Object.assign({}, s); })
+            : DE_STATUS_OFFSETS.map(function (o) {
+                return { offset: o, scheduledAt: null, result: null, error: null, ts: null, apiTs: null };
+              }),
+        });
+        /* Terminal states belong in history, not watches */
+        if (restored.state === 'EXPIRED' || restored.state === 'DISMISSED' || restored.state === 'MOOT') continue;
+        /* Normalize unstable candidate state */
+        if (restored.state === 'CANDIDATE') {
+          restored.state       = 'WATCHING';
+          restored.stateReason = 'Restored after reload';
+          restored.candidateTs = null;
+        }
+        /* Drop stale WATCHING entries (save is older than DE_EXPIRE_MS) */
+        if (restored.state === 'WATCHING' && ageMs > DE_EXPIRE_MS) continue;
+        _watches.set(w.gameId, restored);
+      }
+
+      /* Merge history, deduplicate by gameId */
+      var existingIds = new Set(_history.map(function (h) { return h.gameId; }));
+      for (var j = 0; j < data.history.length; j++) {
+        var h = data.history[j];
+        if (!h || !h.gameId || existingIds.has(h.gameId)) continue;
+        _history.push(Object.assign({}, h, {
+          statusChecks: Array.isArray(h.statusChecks)
+            ? h.statusChecks.map(function (s) { return Object.assign({}, s); }) : [],
+        }));
+        existingIds.add(h.gameId);
+      }
+      if (_history.length > DE_HISTORY_MAX) _history = _history.slice(0, DE_HISTORY_MAX);
+      _absCount.clear();
+      return true;
+    }
+
+    function importFromBackup(data) {
+      if (!data || typeof data.version !== 'number') {
+        return { ok: false, added: 0, error: 'Invalid backup format' };
+      }
+      if (data.version !== DE_STORE_VERSION) {
+        return { ok: false, added: 0, error: 'Schema version mismatch (got v' + data.version + ', expected v' + DE_STORE_VERSION + ')' };
+      }
+      var allEntries = [];
+      if (Array.isArray(data.watches)) allEntries = allEntries.concat(data.watches);
+      if (Array.isArray(data.history)) allEntries = allEntries.concat(data.history);
+      var existingIds = new Set();
+      _watches.forEach(function (e) { existingIds.add(e.gameId); });
+      _history.forEach(function (e) { existingIds.add(e.gameId); });
+      var added = 0;
+      for (var i = 0; i < allEntries.length; i++) {
+        var e = allEntries[i];
+        if (!e || !e.gameId || existingIds.has(e.gameId)) continue;
+        _history.push(Object.assign({}, e, {
+          statusChecks: Array.isArray(e.statusChecks)
+            ? e.statusChecks.map(function (s) { return Object.assign({}, s); }) : [],
+        }));
+        existingIds.add(e.gameId);
+        added++;
+      }
+      if (_history.length > DE_HISTORY_MAX) _history = _history.slice(0, DE_HISTORY_MAX);
+      if (added > 0) _dirty = true;
+      return { ok: true, added: added, error: null };
+    }
+
+    function isDirty()    { return _dirty; }
+    function clearDirty() { _dirty = false; }
 
     function _getWatches() { return _watches; } /* test-only */
     function _reset() {                          /* test-only */
-      _watches.clear(); _history = []; _absCount.clear(); _suspended = false;
+      _watches.clear(); _history = []; _absCount.clear(); _suspended = false; _dirty = false;
     }
 
     return {
       observeSnapshot, observePlayerStatus, tick, getDueChecks,
       getCandidates, getHistory, resetOrSuspend, resume,
-      setOutcome, dismiss, _updateStatusResult, _getWatches, _reset,
+      setOutcome, dismiss, _updateStatusResult,
+      exportState, importState, importFromBackup,
+      isDirty, clearDirty,
+      _getWatches, _reset,
     };
   })();
 
-  /* ============================ 9. STATUS CHECKER ============================ */
+  /* ============================ 9. PERSISTENCE STORE ============================ */
+  /*
+   * Persists DisappearanceEngine state across reloads and restarts.
+   * Storage: GM_getValue/GM_setValue (TM/VM/Torn PDA) with localStorage fallback.
+   * probe() verifies storage before the first write; save() is throttled to
+   * DE_SAVE_THROTTLE_MS; load() is called once at boot.
+   * API keys are NEVER stored — only gameIds, timestamps, scores and outcomes.
+   */
+  const PersistenceStore = (function () {
+    let _available = false;
+    let _probed    = false;
+    let _lastSave  = 0;
+    let _timer     = null;
+
+    function _gmGet(key, def) {
+      if (typeof GM_getValue === 'function') {
+        try {
+          var v = GM_getValue(key, def);
+          return (v !== undefined && v !== null) ? v : def;
+        } catch (e) { /* fall through */ }
+      }
+      try {
+        var raw = localStorage.getItem(key);
+        return raw === null ? def : JSON.parse(raw);
+      } catch (e) {}
+      return def;
+    }
+
+    function _gmSet(key, val) {
+      if (typeof GM_setValue === 'function') {
+        try { GM_setValue(key, val); return true; } catch (e) { /* fall through */ }
+      }
+      try {
+        localStorage.setItem(key, typeof val === 'string' ? val : JSON.stringify(val));
+        return true;
+      } catch (e) {}
+      return false;
+    }
+
+    function probe() {
+      var sentinel = { _probe: 1 };
+      if (!_gmSet(DE_STORE_KEY + '_probe', sentinel)) {
+        _available = false; _probed = true; return false;
+      }
+      var back = _gmGet(DE_STORE_KEY + '_probe', null);
+      if (back && typeof back === 'object') {
+        _available = back._probe === 1;
+      } else if (typeof back === 'string') {
+        try { _available = JSON.parse(back)._probe === 1; } catch (e) { _available = false; }
+      } else {
+        _available = false;
+      }
+      _probed = true;
+      return _available;
+    }
+
+    function _doSave(ts) {
+      _lastSave = ts;
+      var state = DisappearanceEngine.exportState();
+      _gmSet(DE_STORE_KEY, {
+        version: DE_STORE_VERSION,
+        savedAt: ts,
+        watches: state.watches,
+        history: state.history,
+      });
+    }
+
+    function save(now) {
+      if (!_available) return;
+      var ts  = now || Date.now();
+      var gap = ts - _lastSave;
+      if (gap >= DE_SAVE_THROTTLE_MS) {
+        if (_timer) { clearTimeout(_timer); _timer = null; }
+        _doSave(ts);
+        return;
+      }
+      if (!_timer) {
+        var remain = DE_SAVE_THROTTLE_MS - gap;
+        _timer = setTimeout(function () { _timer = null; _doSave(Date.now()); }, remain + 50);
+      }
+    }
+
+    function load() {
+      if (!_probed) probe();
+      var data = _gmGet(DE_STORE_KEY, null);
+      if (!data || typeof data !== 'object') return false;
+      if (data.version !== DE_STORE_VERSION) return false;
+      return DisappearanceEngine.importState(data);
+    }
+
+    function isAvailable() { return _available; }
+    function _forceNow(ts) { _lastSave = 0; _doSave(ts || Date.now()); } /* test-only: bypass throttle */
+
+    return { probe, save, load, isAvailable, _forceNow };
+  })();
+
+  /* ============================ 10. STATUS CHECKER ============================ */
   /*
    * Rate-limited scheduler for Torn API status checks.
    * Calls DisappearanceEngine.observePlayerStatus() on success.
@@ -1584,7 +1826,77 @@
     return { tick, canCheck, _parseRespTest };
   })();
 
-  /* ============================ 10. UI ============================ */
+  /* ============================ 11. EXPORT / IMPORT HELPERS ============================ */
+
+  function _sanitizeForExport(entry) {
+    var copy = Object.assign({}, entry);
+    delete copy.apiKey; delete copy.key; delete copy.token;
+    if (Array.isArray(copy.statusChecks)) {
+      copy.statusChecks = copy.statusChecks.map(function (s) {
+        var sc = Object.assign({}, s);
+        delete sc.apiKey; delete sc.key; delete sc.token;
+        return sc;
+      });
+    }
+    return copy;
+  }
+
+  function exportHistoryJSON() {
+    var state = DisappearanceEngine.exportState();
+    return JSON.stringify({
+      version:    DE_STORE_VERSION,
+      exportedAt: Date.now(),
+      watches:    state.watches.map(_sanitizeForExport),
+      history:    state.history.map(_sanitizeForExport),
+    }, null, 2);
+  }
+
+  function exportHistoryCSV() {
+    function csvField(v) {
+      if (v == null) return '';
+      var s = String(v);
+      return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+    }
+    var state = DisappearanceEngine.exportState();
+    var all = state.history.concat(
+      state.watches.filter(function (w) {
+        return w.state === 'CONFIRMED' || w.state === 'HOSPITAL';
+      })
+    );
+    var rows = ['gameId,playerName,playerId,bet,confirmedAt,outcome,latestStatus,priority,state'];
+    for (var i = 0; i < all.length; i++) {
+      var e = all[i];
+      rows.push([
+        csvField(e.gameId), csvField(e.playerName), csvField(e.playerId),
+        csvField(e.bet),    csvField(e.confirmedTs), csvField(e.outcome),
+        csvField(e.latestStatus), csvField(e.priority), csvField(e.state),
+      ].join(','));
+    }
+    return rows.join('\r\n');
+  }
+
+  function importHistoryJSON(text) {
+    var data;
+    try { data = JSON.parse(text); } catch (e) { return { ok: false, added: 0, error: 'Invalid JSON' }; }
+    return DisappearanceEngine.importFromBackup(data);
+  }
+
+  function downloadText(filename, mimeType, text) {
+    try {
+      var blob = new Blob([text], { type: mimeType });
+      var url  = URL.createObjectURL(blob);
+      var a    = document.createElement('a');
+      a.href = url; a.download = filename; a.style.display = 'none';
+      document.body.appendChild(a); a.click();
+      setTimeout(function () {
+        URL.revokeObjectURL(url);
+        if (a.parentNode) a.parentNode.removeChild(a);
+      }, 1000);
+      return true;
+    } catch (e) { return false; }
+  }
+
+  /* ============================ 12. UI ============================ */
   const UI = (function () {
     let host = null, shadow = null, _open = false;
     let $fab, $ov, $tgl, $cls, $bd;
@@ -1655,6 +1967,10 @@
       '.dw-hist-oc.L{color:#c06070}',
       '.dw-hist-oc.T{color:#6070a0}',
       '.dw-empty{font-size:11px;color:#3a2050;padding:8px 0;text-align:center}',
+      '.dw-exp-row{display:flex;gap:4px;flex-wrap:wrap;margin-top:5px;padding-top:4px;border-top:1px solid #1e1030}',
+      '.dw-imp{margin-top:4px}',
+      '.dw-imp textarea{display:block;width:100%;height:90px;background:#040110;color:#9080c0;border:1px solid #2a1040;border-radius:4px;font:10px/1.3 "Courier New",monospace;padding:5px;resize:none;-webkit-user-select:text;user-select:text}',
+      '.dw-imp-err{font-size:10px;color:#f06060;margin-bottom:3px}',
       /* diagnostic output panel */
       '.dg-wrap{margin-top:7px;border-top:1px solid #2a1040;padding-top:5px}',
       '.dg-hd{display:flex;align-items:center;justify-content:space-between;font-size:11px;color:#8060b0;margin-bottom:3px}',
@@ -1809,27 +2125,70 @@
       }
       html += '</div>';
 
-      /* Recent history */
-      if (dwHist.length) {
-        html += '<div class="dw-hist"><strong>' + dwHist.length + ' in history</strong>';
-        if (State.dwHistOpen) {
-          var showH = dwHist.slice(0, 10);
-          for (var hi = 0; hi < showH.length; hi++) {
-            var hc = showH[hi];
-            var ocCls = hc.outcome === 'Won' ? '' : hc.outcome === 'Lost' ? ' L' : ' T';
-            html += '<div class="dw-hist-item">';
-            html += '<span class="dw-hist-nm">' + esc(hc.playerName) + ' (' + esc(hc.gameId) + ')</span>';
-            html += '<span>' + esc(hc.state) + '</span>';
-            if (hc.outcome) html += '<span class="dw-hist-oc' + ocCls + '">' + esc(hc.outcome) + '</span>';
-            html += '</div>';
-          }
+      /* History — paginated, accurate count */
+      html += '<div class="dw-hist">';
+      html += '<strong>' + dwHist.length + ' in history</strong>';
+      html += '&nbsp;<button class="lbtn" id="rrmt-dw-hist-tgl">' +
+              (State.dwHistOpen ? '\u25B2 Hide' : '\u25BC History') + '</button>';
+      if (State.dwHistOpen && dwHist.length > 0) {
+        var pageSize  = DE_HIST_PAGE_SIZE;
+        var pageCount = Math.max(1, Math.ceil(dwHist.length / pageSize));
+        var page      = Math.min(Math.max(0, State.dwHistPage), pageCount - 1);
+        var hStart    = page * pageSize;
+        var showH     = dwHist.slice(hStart, hStart + pageSize);
+        for (var hi = 0; hi < showH.length; hi++) {
+          var hc = showH[hi];
+          var ocCls = hc.outcome === 'Won' ? '' : hc.outcome === 'Lost' ? ' L' : ' T';
+          html += '<div class="dw-hist-item">';
+          html += '<span class="dw-hist-nm">' + esc(hc.playerName || '') + ' (' + esc(hc.gameId) + ')</span>';
+          html += '<span>' + esc(hc.state) + '</span>';
+          if (hc.outcome) html += '<span class="dw-hist-oc' + ocCls + '">' + esc(hc.outcome) + '</span>';
+          html += '</div>';
         }
-        html += '&nbsp;<button class="lbtn" id="rrmt-dw-hist-tgl">' +
-                (State.dwHistOpen ? '\u25B2 Hide' : '\u25BC History') + '</button>';
+        if (pageCount > 1) {
+          html += '<div style="display:flex;gap:4px;margin-top:3px;align-items:center;font-size:10px;color:#6a4a7a">';
+          html += '<button class="lbtn" id="rrmt-dw-hist-prev"' + (page === 0 ? ' disabled' : '') + '>&laquo;</button>';
+          html += '<span>' + (page + 1) + '\u202F/\u202F' + pageCount + '</span>';
+          html += '<button class="lbtn" id="rrmt-dw-hist-next"' + (page >= pageCount - 1 ? ' disabled' : '') + '>&raquo;</button>';
+          html += '</div>';
+        }
+      }
+      html += '</div>';
+
+      /* Export / Import row */
+      html += '<div class="dw-exp-row">';
+      html += '<button class="lbtn" id="rrmt-dw-exp-json">Export JSON</button>';
+      html += '<button class="lbtn" id="rrmt-dw-exp-csv">Export CSV</button>';
+      html += '<button class="lbtn" id="rrmt-dw-imp-tgl">' + (State.dwImportOpen ? 'Cancel Import' : 'Import JSON') + '</button>';
+      if (PersistenceStore.isAvailable()) {
+        html += '<span style="font-size:9px;color:#5a8060;margin-left:2px">\u2713&nbsp;saved</span>';
+      }
+      html += '</div>';
+
+      /* Import textarea — visible when dwImportOpen */
+      if (State.dwImportOpen) {
+        html += '<div class="dw-imp">';
+        if (State.dwImportError) {
+          html += '<div class="dw-imp-err">' + esc(State.dwImportError) + '</div>';
+        }
+        html += '<textarea id="rrmt-dw-imp-ta" placeholder="Paste exported JSON here\u2026"></textarea>';
+        html += '<div style="display:flex;gap:4px;margin-top:3px">';
+        html += '<button class="lbtn" id="rrmt-dw-imp-apply">Apply Import</button>';
+        html += '</div>';
         html += '</div>';
       }
 
       html += '</div>'; /* /dws */
+
+      /* Export output fallback — shown when download failed (e.g. Torn PDA) */
+      if (State.exportOutput) {
+        html += '<div class="dg-wrap">';
+        html += '<div class="dg-hd"><span>\uD83D\uDCE4 ' + esc(State.exportOutputFn || 'Export') + '</span>';
+        html += '<button class="lbtn" id="rrmt-exp-clr">\u2715 Clear</button></div>';
+        html += '<div class="dg-hint">Select all \u2192 copy, or long-press to share</div>';
+        html += '<textarea class="dg-ta" id="rrmt-exp-ta" readonly></textarea>';
+        html += '</div>';
+      }
 
       html += '<div class="cfg"><label>Min bet:&nbsp;<input id="rrmt-mb" type="text" value="' + esc(fmtBet(State.minBet)) + '" placeholder="e.g. 200M"></label></div>';
       html += '<button class="lbtn" id="rrmt-lb">Copy log (last 50)</button>';
@@ -1864,6 +2223,16 @@
         });
       }
 
+      /* Export output fallback textarea */
+      if (State.exportOutput) {
+        const expTa = shadow.getElementById('rrmt-exp-ta');
+        if (expTa) expTa.value = State.exportOutput;
+        const expClr = shadow.getElementById('rrmt-exp-clr');
+        if (expClr) expClr.addEventListener('click', function () {
+          State.exportOutput = null; State.exportOutputFn = ''; render();
+        });
+      }
+
       /* Disappearance Watch event listeners */
       shadow.querySelectorAll('[data-dw-dismiss]').forEach(function (btn) {
         btn.addEventListener('click', function () {
@@ -1890,6 +2259,58 @@
       const dwHistTgl = shadow.getElementById('rrmt-dw-hist-tgl');
       if (dwHistTgl) dwHistTgl.addEventListener('click', function () {
         State.dwHistOpen = !State.dwHistOpen; render();
+      });
+
+      const dwHistPrev = shadow.getElementById('rrmt-dw-hist-prev');
+      if (dwHistPrev) dwHistPrev.addEventListener('click', function () {
+        if (State.dwHistPage > 0) { State.dwHistPage--; render(); }
+      });
+      const dwHistNext = shadow.getElementById('rrmt-dw-hist-next');
+      if (dwHistNext) dwHistNext.addEventListener('click', function () {
+        State.dwHistPage++; render();
+      });
+
+      function _doExport(text, fname, mime) {
+        var downloaded = downloadText(fname, mime, text);
+        if (!downloaded) {
+          State.exportOutput   = text;
+          State.exportOutputFn = fname;
+          render();
+          var ta = shadow.getElementById('rrmt-exp-ta');
+          if (ta) ta.value = text;
+        }
+      }
+      const expJsonEl = shadow.getElementById('rrmt-dw-exp-json');
+      if (expJsonEl) expJsonEl.addEventListener('click', function () {
+        var ts = new Date().toISOString().slice(0, 10);
+        _doExport(exportHistoryJSON(), 'rrmt-history-' + ts + '.json', 'application/json');
+      });
+      const expCsvEl = shadow.getElementById('rrmt-dw-exp-csv');
+      if (expCsvEl) expCsvEl.addEventListener('click', function () {
+        var ts = new Date().toISOString().slice(0, 10);
+        _doExport(exportHistoryCSV(), 'rrmt-history-' + ts + '.csv', 'text/csv');
+      });
+      const impTglEl = shadow.getElementById('rrmt-dw-imp-tgl');
+      if (impTglEl) impTglEl.addEventListener('click', function () {
+        State.dwImportOpen  = !State.dwImportOpen;
+        State.dwImportError = '';
+        render();
+      });
+      const impApplyEl = shadow.getElementById('rrmt-dw-imp-apply');
+      if (impApplyEl) impApplyEl.addEventListener('click', function () {
+        var ta   = shadow.getElementById('rrmt-dw-imp-ta');
+        var text = ta ? ta.value.trim() : '';
+        if (!text) { State.dwImportError = 'No data to import'; render(); return; }
+        var result = importHistoryJSON(text);
+        if (result.ok) {
+          State.dwImportOpen  = false;
+          State.dwImportError = '';
+          PersistenceStore.save(Date.now());
+          DisappearanceEngine.clearDirty();
+        } else {
+          State.dwImportError = result.error || 'Import failed';
+        }
+        render();
       });
 
       const mbEl = shadow.getElementById('rrmt-mb');
@@ -2012,6 +2433,8 @@
   /* ============================ 10. BOOT ============================ */
   function boot() {
     if (!document.body) { document.addEventListener('DOMContentLoaded', boot, { once: true }); return; }
+    PersistenceStore.probe();
+    PersistenceStore.load();
     UI.build();
     window.__RRMT__ = { version: VERSION, isAlive: UI.isAlive, destroy: UI.destroy, open: UI.open, close: UI.close };
     if (window.__RRMT_EXPOSE__ === true) {
@@ -2028,6 +2451,9 @@
         State, UI,
         UI_LABEL,
         DisappearanceEngine, StatusChecker,
+        PersistenceStore,
+        DE_HISTORY_MAX, DE_STORE_VERSION,
+        exportHistoryJSON, exportHistoryCSV, importHistoryJSON,
       };
     }
   }
