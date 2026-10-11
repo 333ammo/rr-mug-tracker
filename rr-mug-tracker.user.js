@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RR Mug Tracker
 // @namespace    fatboy.torn
-// @version      1.1.2
+// @version      1.1.3
 // @description  Russian Roulette lobby tracker with disappearance-watch intelligence for Torn PDA (iOS) and desktop.
 // @author       FATBOY [572123]
 // @match        https://www.torn.com/page.php*
@@ -13,6 +13,37 @@
 // ==/UserScript==
 
 /*
+ * RR Mug Tracker v1.1.3 — Settings persistence fix, DW flush-on-navigate, hospital attack block, timer labels.
+ *
+ * v1.1.3 changes:
+ *   - Bug fix (CRITICAL): Min Bet preference was never saved to storage — reverted to $200M on every
+ *     navigation or reload.  Added MIN_BET_PREF_KEY ("rrmt_mb_pref"); handler now calls savePref;
+ *     boot() now loads and applies the saved value before building the UI.
+ *   - Bug fix: Disappearance Watch state could be lost on fast navigation if the 5s save throttle
+ *     had not yet fired.  PersistenceStore.flush() added — forces an immediate write bypassing the
+ *     throttle.  Called from stopTracking(), visibilitychange (hidden), and window pagehide.
+ *   - Bug fix (defensive): PersistenceStore.load() now parses a JSON string returned by
+ *     GM_getValue — some userscript hosts serialise stored objects as strings on retrieval.
+ *   - Bug fix: Panel lobby timers lost their "Est. remaining (≈15 min, not guaranteed): " prefix
+ *     after the first tickTimers() call, because the tick wrote only the raw countdown value.
+ *     tickTimers() now restores the full label on each update.
+ *   - Hospital entries in Disappearance Watch: Attack link replaced with a compact
+ *     "Hospital — not actionable" notice while known status is Hospital.  Profile link
+ *     kept.  When a subsequent status check reports Okay, the Attack link is restored.
+ *   - Text contrast improved further across lobby and DW: IDs, durations, status text,
+ *     counters, secondary labels.
+ *   - Outcome buttons (W/L/T/?) given a compact inline legend: "W Won · L Lost · T Timeout · ? Unknown"
+ *     rendered once per DW section so the meaning is always visible on touchscreens.
+ *   - Mug Priority: compact visible note "Priority = heuristic rank (0–100) — not a cash probability"
+ *     rendered once above the DW cards.  Badge also carries a title= tooltip.
+ *   - Bug fix: _updateStatusResult now transitions HOSPITAL → CONFIRMED when a newer Okay status
+ *     is received, restoring the Attack link and removing the "Not actionable" notice.
+ *   - DW empty-state messages distinguish between "no records ever" and "no active watches
+ *     — N in history below", avoiding the misleading implication that earlier confirmed
+ *     disappearances were never observed.
+ *   - Suite AA added: 12 regression tests (AA1–AA12) covering persistence save/load,
+ *     flush behaviour, hospital non-actionable rendering, timer labels, empty states.
+ *
  * RR Mug Tracker v1.1.2 — Independent minimum-bet filters, adaptive panel height, visual polish.
  *
  * v1.1.2 changes:
@@ -391,7 +422,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.1.2';
+  const VERSION = '1.1.3';
   if (window.top !== window.self) return;
 
   /* isRRPage accepts optional (pn, qs) args for test-harness use */
@@ -432,6 +463,7 @@
   const DE_STORE_VERSION        = 1;
   const DE_SAVE_THROTTLE_MS     = 5000;
   const DW_PREF_KEY             = 'rrmt_dw_pref';  /* separate key — never mixed with DE_STORE_KEY */
+  const MIN_BET_PREF_KEY        = 'rrmt_mb_pref';  /* persists State.minBet (lobby filter) across reloads */
   const DEFAULT_DW_MIN_BET      = 50000000;         /* $50M default watch display filter */
   const DE_INFLIGHT_TIMEOUT_MS  = 15000;            /* force-clear stalled _inFlight guard */
   const DE_RETRY_DELAY_MS       = 400;              /* delay before single transient retry */
@@ -1206,6 +1238,7 @@
     if (_renderTimer) { clearInterval(_renderTimer); _renderTimer = null; }
     if (_tickTimer) { clearInterval(_tickTimer); _tickTimer = null; }
     removeInlineTimers();
+    PersistenceStore.flush();  /* save any pending state before suspending */
     DisappearanceEngine.resetOrSuspend();
     UI.render();
   }
@@ -1300,7 +1333,10 @@
     try {
       State.games.forEach(function (g) {
         const el = UI.getTimerEl(g.gameKey);
-        if (el) el.textContent = formatCountdown(g.firstSeen, now);
+        /* Preserve the label that render() wrote — only the countdown value changes */
+        if (el && g.firstSeen != null) {
+          el.textContent = 'Est. remaining (\u224815\u00a0min, not guaranteed): ' + formatCountdown(g.firstSeen, now);
+        }
       });
     } catch (e) { /* defensive */ }
     updateLobbyTimers(now);
@@ -1750,6 +1786,10 @@
         entry.hospitalReason = cls.code;
         entry.hospitalLabel  = cls.label;
         if (typeof until === 'number') entry.hospitalUntil = until;
+      } else if (status === 'Okay' && isLatest && entry.state === 'HOSPITAL') {
+        /* Recovery: a newer Okay confirms the player left hospital — restore to actionable */
+        entry.state       = 'CONFIRMED';
+        entry.stateReason = 'Recovered \u2014 status: Okay';
       }
       var pr = _computePriority(entry, ts);
       entry.priority       = pr.score;
@@ -1964,7 +2004,12 @@
     function load() {
       if (!_probed) probe();
       var data = _gmGet(DE_STORE_KEY, null);
-      if (!data || typeof data !== 'object') return false;
+      if (!data) return false;
+      /* Some GM hosts return stored objects as JSON strings — parse defensively */
+      if (typeof data === 'string') {
+        try { data = JSON.parse(data); } catch (e) { return false; }
+      }
+      if (typeof data !== 'object') return false;
       if (data.version !== DE_STORE_VERSION) return false;
       return DisappearanceEngine.importState(data);
     }
@@ -1972,10 +2017,17 @@
     function isAvailable() { return _available; }
     function _forceNow(ts) { _lastSave = 0; _doSave(ts || Date.now()); } /* test-only: bypass throttle */
 
+    /* flush() — forces an immediate save regardless of throttle; call on navigate/page-hide */
+    function flush() {
+      if (!_available) return;
+      if (_timer) { clearTimeout(_timer); _timer = null; }
+      _doSave(Date.now());
+    }
+
     function savePref(key, val) { if (!_probed) probe(); _gmSet(key, val); }
     function loadPref(key, def) { if (!_probed) probe(); return _gmGet(key, def); }
 
-    return { probe, save, load, isAvailable, _forceNow, savePref, loadPref };
+    return { probe, save, load, flush, isAvailable, _forceNow, savePref, loadPref };
   })();
 
   /* ============================ 10. STATUS CHECKER ============================ */
@@ -2255,10 +2307,10 @@
       '.gm.hi{border-color:#6a2a9a;background:#16082a}',
       '.gn{display:flex;align-items:baseline;justify-content:space-between;gap:4px;flex-wrap:nowrap}',
       '.gnm{font-weight:600;color:#c080f0;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1 1 0}',
-      '.gid{font-size:10px;color:#7a6090;flex-shrink:0;font-weight:400;white-space:nowrap}',
-      '.gx{font-size:11px;color:#8060a0;margin-top:2px}',
-      '.ga{font-size:11px;color:#6a5080;margin-top:1px}',
-      '.ge{font-size:10px;color:#7a5a8a;font-style:italic}',
+      '.gid{font-size:10px;color:#9070b0;flex-shrink:0;font-weight:400;white-space:nowrap}',
+      '.gx{font-size:11px;color:#9070b0;margin-top:2px}',
+      '.ga{font-size:11px;color:#8070a0;margin-top:1px}',
+      '.ge{font-size:10px;color:#8070a0;font-style:italic}',
       '.gl{display:flex;gap:5px;margin-top:5px}',
       '.gl a{flex:1;padding:5px 2px;text-align:center;border-radius:5px;border:1px solid #3a1a5a;background:#0c0420;color:#9070b0;font-size:11px;font-weight:600;text-decoration:none;touch-action:manipulation;-webkit-tap-highlight-color:transparent;display:block;cursor:pointer}',
       '.gl a.dis{opacity:.35;pointer-events:none;cursor:default}',
@@ -2279,9 +2331,9 @@
       '.dwp{display:inline-block;min-width:26px;height:16px;border-radius:8px;text-align:center;font-size:9px;font-weight:700;line-height:16px;padding:0 4px;margin-right:4px;background:#2a1040;color:#c080f0}',
       '.dwp.hi{background:#4a1020;color:#f08080}',
       '.dwn{font-weight:600;color:#c080f0;font-size:12px}',
-      '.dwid{font-size:10px;color:#7a6090;margin-left:3px}',
-      '.dwx{font-size:11px;color:#8060a0;margin-top:2px}',
-      '.dwst{font-size:10px;color:#8060a0;margin-top:1px}',
+      '.dwid{font-size:10px;color:#9070b0;margin-left:3px}',
+      '.dwx{font-size:11px;color:#9070b0;margin-top:2px}',
+      '.dwst{font-size:10px;color:#9070b0;margin-top:1px}',
       '.dwst.ok{color:#5cb85c}',
       '.dwst.ho{color:#c09040}',
       '.dwrsn{font-size:10px;color:#a070c0;margin-top:2px;font-style:italic}',
@@ -2298,7 +2350,7 @@
       '.dw-cfg input[type=checkbox]{width:13px;height:13px;accent-color:#8040c0;cursor:pointer}',
       '.dw-cfg input[type=password]{max-width:130px;padding:3px 6px;border-radius:4px;border:1px solid #3a1a5a;background:#080410;color:#ddd0f0;font:10px inherit}',
       '.dw-cfg input[type=text]{width:60px;padding:3px 6px;border-radius:4px;border:1px solid #3a1a5a;background:#080410;color:#ddd0f0;font:10px inherit}',
-      '.dw-cnt{font-size:10px;color:#6a4a80;padding:4px 0 2px}',
+      '.dw-cnt{font-size:10px;color:#8060a0;padding:4px 0 2px}',
       '.dwnt{color:#7a5090;font-variant-numeric:tabular-nums}',
       '.dw-hist{margin-top:4px;padding-top:4px;border-top:1px solid #1e1030;font-size:10px;color:#5a4070}',
       '.dw-hist-item{padding:2px 0;display:flex;gap:5px;align-items:baseline;flex-wrap:wrap}',
@@ -2308,6 +2360,10 @@
       '.dw-hist-oc.T{color:#6070a0}',
       '.dw-empty{font-size:11px;color:#6a4a7a;padding:8px 0;text-align:center}',
       /* hospital / inactive subsection */
+      '.dw-legend{font-size:9px;color:#6a4a7a;padding:2px 0 4px;letter-spacing:.01em}',
+      '.dw-legend span{color:#7a5a8a}',
+      '.dw-prinfo{font-size:9px;color:#5a406a;padding:1px 0 4px;font-style:italic}',
+      '.dw-hosp-noatk{font-size:9px;color:#7a5040;padding:3px 7px;border-radius:4px;border:1px solid #2a1a1a;background:#100808;white-space:nowrap}',
       '.dw-hosp-wrap{margin-top:5px;padding-top:4px;border-top:1px solid #1e1030}',
       '.dw-hosp-tgl{display:flex;width:100%;align-items:center;justify-content:space-between;padding:4px 7px;border-radius:5px;border:1px solid #2a1a3a;background:#0a0418;color:#6a4a6a;font-size:10px;font-weight:600;cursor:pointer;touch-action:manipulation}',
       '.dw-hosp-badge{font-size:9px;background:#1a1a3a;border-radius:8px;padding:1px 5px;color:#6a6090;margin-left:2px}',
@@ -2383,7 +2439,7 @@
           /* Bet row */
           html += '<div class="gx">Bet:&nbsp;<span' + (hi ? ' class="ok"' : '') + '>' + esc(fmtBet(g.bet)) + '</span>';
           if (g.playerCount != null) html += '&nbsp;&middot;&nbsp;Players:&nbsp;' + g.playerCount;
-          if (g.gameId) html += '&nbsp;&middot;&nbsp;<span style="color:#6a4a7a;font-size:10px">Game:' + esc(g.gameId) + '</span>';
+          if (g.gameId) html += '&nbsp;&middot;&nbsp;<span style="color:#8060a0;font-size:10px">Game:' + esc(g.gameId) + '</span>';
           html += '</div>';
           /* Age + countdown — single note when age unknown to avoid duplicate "Age unknown" */
           if (g.firstSeen == null) {
@@ -2423,8 +2479,9 @@
         var cardCls = isHospCard ? ' sup' : (isAct ? ' act' : '');
         var s = '<div class="dwc' + cardCls + '">';
         /* Name + priority badge */
+        var isHosp = dc.state === 'HOSPITAL';
         s += '<div>';
-        s += '<span class="dwp' + (isAct ? ' hi' : '') + '">' + dc.priority + '</span>';
+        s += '<span class="dwp' + (isAct ? ' hi' : '') + '" title="Heuristic investigation priority (0\u2013100) \u2014 not a cash probability.">' + dc.priority + '</span>';
         s += '<span class="dwn">' + esc(dc.playerName) + '</span>';
         s += '<span class="dwid">#' + esc(dc.playerId) + '</span>';
         if (isHospCard) s += '<span class="dw-hosp-lbl">In hospital</span>';
@@ -2484,10 +2541,15 @@
              ' target="_blank" rel="noopener noreferrer"' +
              ' aria-label="Profile" title="View profile"' +
              ' class="prf ico' + (dwProfURL ? '' : ' dis') + '">\uD83D\uDC64</a>';
-        s += '<a' + (dwAtkURL ? ' href="' + esc(dwAtkURL) + '"' : '') +
-             ' target="_blank" rel="noopener noreferrer"' +
-             ' aria-label="Attack" title="Attack player"' +
-             ' class="atk ico' + (dwAtkURL ? '' : ' dis') + '">\u2694\uFE0F</a>';
+        /* Attack link disabled while known status is Hospital */
+        if (isHosp) {
+          s += '<span class="dw-hosp-noatk" title="Player is in hospital \u2014 not actionable">\uD83C\uDFE5\u00a0Not\u00a0actionable</span>';
+        } else {
+          s += '<a' + (dwAtkURL ? ' href="' + esc(dwAtkURL) + '"' : '') +
+               ' target="_blank" rel="noopener noreferrer"' +
+               ' aria-label="Attack" title="Attack player"' +
+               ' class="atk ico' + (dwAtkURL ? '' : ' dis') + '">\u2694\uFE0F</a>';
+        }
         s += '<button class="dsm" data-dw-dismiss="' + esc(dc.gameId) + '">Dismiss</button>';
         var ocLabels = [['Won','W'],['Lost','L'],['Timeout','T'],['Unknown','?']];
         for (var oi = 0; oi < ocLabels.length; oi++) {
@@ -2502,7 +2564,12 @@
       }
 
       if (!dwCands.length) {
-        html += '<div class="dw-empty">No confirmed disappearances yet</div>';
+        /* Distinguish "never recorded" from "all moved to history" */
+        if (dwHist.length > 0) {
+          html += '<div class="dw-empty">No active watches\u00a0\u2014 ' + dwHist.length + '\u00a0in history below.</div>';
+        } else {
+          html += '<div class="dw-empty">No disappearances recorded yet.</div>';
+        }
       } else if (!dwFiltered.length) {
         html += '<div class="dw-cnt">0 watched&nbsp;&middot;&nbsp;' + dwCands.length + ' total disappeared</div>';
         html += '<div class="dw-empty">No disappeared games above your min watch bet.</div>';
@@ -2510,6 +2577,10 @@
         if (dwFiltered.length < dwCands.length) {
           html += '<div class="dw-cnt">' + dwFiltered.length + ' watched&nbsp;&middot;&nbsp;' + dwCands.length + ' total disappeared</div>';
         }
+        /* Compact outcome legend — visible on touch devices that have no hover */
+        html += '<div class="dw-legend">Outcomes:&nbsp;<span>W\u202FWon</span>&nbsp;\u00b7&nbsp;<span>L\u202FLost</span>&nbsp;\u00b7&nbsp;<span>T\u202FTimeout</span>&nbsp;\u00b7&nbsp;<span>?\u202FUnknown</span></div>';
+        /* Priority heuristic note — visible text, not just a tooltip */
+        html += '<div class="dw-prinfo">Priority\u202F=\u202Fheuristic\u202Frank\u00a0(0\u2013100)\u00a0\u2014\u00a0not\u00a0a\u00a0cash\u00a0probability</div>';
         /* Active (non-hospital) candidates */
         if (!dwActive.length) {
           html += '<div class="dw-empty">All tracked players are currently in hospital.</div>';
@@ -2801,7 +2872,7 @@
       const mbEl = shadow.getElementById('rrmt-mb');
       if (mbEl) mbEl.addEventListener('change', function () {
         const v = parseMinBet(this.value);
-        if (v && v > 0) { State.minBet = v; render(); }
+        if (v && v > 0) { State.minBet = v; PersistenceStore.savePref(MIN_BET_PREF_KEY, v); render(); }
       });
 
       const dwMbEl = shadow.getElementById('rrmt-dw-mb');
@@ -2947,8 +3018,14 @@
     if (!isRRPage()) { stopTracking(); UI.destroy(); window.removeEventListener('popstate', onNav); }
   }, { passive: true });
 
+  /* pagehide is a Window event — fires on WKWebView full-page navigations before unload */
+  window.addEventListener('pagehide', function () {
+    PersistenceStore.flush();
+  }, { passive: true });
+
   document.addEventListener('visibilitychange', function () {
     if (document.hidden) {
+      PersistenceStore.flush();  /* persist before tab hides — WKWebView may not wake */
       if (_tickTimer) { clearInterval(_tickTimer); _tickTimer = null; }
       DisappearanceEngine.resetOrSuspend();
     } else {
@@ -2964,6 +3041,9 @@
     PersistenceStore.load();
     var _dwPref = PersistenceStore.loadPref(DW_PREF_KEY, DEFAULT_DW_MIN_BET);
     if (typeof _dwPref === 'number' && _dwPref >= 0) State.dwWatchMin = _dwPref;
+    /* Restore saved Min Bet (lobby filter); never overwrite a saved setting with the default */
+    var _mbPref = PersistenceStore.loadPref(MIN_BET_PREF_KEY, DEFAULT_MIN_BET);
+    if (typeof _mbPref === 'number' && _mbPref > 0) State.minBet = _mbPref;
     /* Respect explicitly saved OFF preference; null (never saved) keeps the default ON */
     var _statusPref = PersistenceStore.loadPref(STATUS_PREF_KEY, null);
     if (_statusPref === false) State.statusEnabled = false;
@@ -2986,7 +3066,7 @@
         DisappearanceEngine, StatusChecker,
         PersistenceStore,
         DE_HISTORY_MAX, DE_STORE_VERSION,
-        DW_PREF_KEY, DEFAULT_DW_MIN_BET, DEFAULT_MIN_BET, STATUS_PREF_KEY,
+        DW_PREF_KEY, DEFAULT_DW_MIN_BET, DEFAULT_MIN_BET, STATUS_PREF_KEY, MIN_BET_PREF_KEY,
         exportHistoryJSON, exportHistoryCSV, importHistoryJSON,
       };
     }
