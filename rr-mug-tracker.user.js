@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RR Mug Tracker
 // @namespace    fatboy.torn
-// @version      1.1.1
+// @version      1.1.2
 // @description  Russian Roulette lobby tracker with disappearance-watch intelligence for Torn PDA (iOS) and desktop.
 // @author       FATBOY [572123]
 // @match        https://www.torn.com/page.php*
@@ -13,6 +13,35 @@
 // ==/UserScript==
 
 /*
+ * RR Mug Tracker v1.1.2 — Independent minimum-bet filters, adaptive panel height, visual polish.
+ *
+ * v1.1.2 changes:
+ *   - Bug fix (v1.1.1 regression): Min Bet and Min Watch Bet are now fully independent.
+ *       • Min Bet controls only the lobby game-card display and counter.
+ *       • Min Watch Bet (dwWatchMin) controls disappearance confirmation, status-check
+ *         scheduling (getDueChecks) and Disappearance Watch display.
+ *       • Removing the max() coupling means a game hidden from the lobby (bet < Min Bet)
+ *         can still be tracked by the Disappearance Watch if bet >= Min Watch Bet.
+ *   - Panel height now adapts to content: max-height caps at the safe-area viewport
+ *     so a near-empty panel no longer fills the whole iPhone screen.  Inner body scrolls.
+ *   - Hospital / Inactive entries moved into a compact collapsed subsection inside
+ *     Disappearance Watch; active (Okay) entries remain in the main list.
+ *   - Lobby counter changed to "N eligible · M filtered".
+ *   - DW counter shows actual eligible watch count.
+ *   - Text contrast improved: player IDs, game IDs, age/timer labels, status text,
+ *     counters and history labels are all more readable on iPhone dark background.
+ *   - Duplicate "Age unknown" label eliminated: when game age cannot be established,
+ *     a single note replaces two separate lines.
+ *   - DW card: "Observed for" line suppressed when firstSeen is unavailable.
+ *   - Status label "checking…" replaced with "pending" — avoids implying an HTTP
+ *     request is in-flight when the check is only queued.
+ *   - Outcome buttons (W/L/T/?) now carry title= tooltips for discoverability.
+ *   - Min Bet and Min Watch Bet input labels clarified in the panel.
+ *   - Suite Z added: 12 regression tests (Z1–Z12) covering independent filter
+ *     behaviour and the corrected display changes.
+ *   - Y7 updated: lobby shows a $25M game when minBet=$20M (dwWatchMin no longer
+ *     gates the lobby).  Y8 updated: getDueChecks gate uses dwWatchMin only.
+ *
  * RR Mug Tracker v1.1.1 — Strict minimum-bet filtering: effective threshold = max(Min Bet, Min Watch Bet).
  *
  * v1.1.1 changes:
@@ -362,7 +391,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.1.1';
+  const VERSION = '1.1.2';
   if (window.top !== window.self) return;
 
   /* isRRPage accepts optional (pn, qs) args for test-harness use */
@@ -433,6 +462,7 @@
     exportOutput:    null,     // export textarea content (always shown on mobile)
     exportOutputFn:  '',       // filename hint for export display
     dwWatchMin:      DEFAULT_DW_MIN_BET,  // watch-panel display filter (0 = show all)
+    dwHospOpen:      false,               // hospital/inactive subsection expanded
   };
 
   /* ============================ 3. PARSING ============================ */
@@ -1548,10 +1578,10 @@
              from confirming a game that may be in the middle of a React rerender */
           if (entry.candidateTs !== null &&
               (timestamp - entry.candidateTs) >= DE_CONFIRM_DEBOUNCE_MS) {
-            /* v1.1.1 eligibility gate: effective threshold = max(Min Bet, Min Watch Bet) */
-            var _thresh = Math.max(State.minBet, State.dwWatchMin);
+            /* v1.1.2: gate uses dwWatchMin only — Min Bet does not block DW tracking */
+            var _thresh = State.dwWatchMin;
             if (_thresh > 0 && entry.bet !== null && entry.bet !== undefined && entry.bet < _thresh) {
-              return; /* below threshold — stay CANDIDATE, no watch entry created */
+              return; /* below watch threshold — stay CANDIDATE */
             }
             entry.state       = 'CONFIRMED';
             entry.stateReason = 'Confirmed absent across ' + abs + ' valid scans';
@@ -1626,11 +1656,10 @@
 
     function getDueChecks(timestamp) {
       var due = [];
-      var _dqThresh = Math.max(State.minBet, State.dwWatchMin);
+      var _dqThresh = State.dwWatchMin; /* v1.1.2: only DW threshold gates status checks */
       _watches.forEach(function (entry) {
         if (entry.state !== 'CONFIRMED') return;
         if (!entry.playerId || !/^\d+$/.test(entry.playerId)) return;
-        /* v1.1.1: skip entries below effective threshold = max(minBet, dwWatchMin) */
         if (_dqThresh > 0 && entry.bet !== null && entry.bet !== undefined && entry.bet < _dqThresh) return;
         for (var i = 0; i < entry.statusChecks.length; i++) {
           var slot = entry.statusChecks[i];
@@ -2213,7 +2242,7 @@
       '.fab{position:fixed;z-index:2147483000;right:10px;bottom:calc(var(--y,120px) + env(safe-area-inset-bottom,0px));padding:8px 14px;border-radius:20px;border:1px solid #6a2a9a;background:rgba(16,10,26,.93);color:#c080f0;font:600 13px/1.2 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;box-shadow:0 2px 10px rgba(0,0,0,.5);touch-action:manipulation;cursor:pointer}',
       '.fab.hide{display:none}',
       '.ov{position:fixed;top:0;left:0;right:0;bottom:0;z-index:2147483001;background:rgba(0,0,0,.55);display:none}.ov.open{display:block}',
-      '.pn{position:absolute;top:max(8px,env(safe-area-inset-top,0px));bottom:max(8px,env(safe-area-inset-bottom,0px));left:max(6px,env(safe-area-inset-left,0px));right:max(6px,env(safe-area-inset-right,0px));max-width:520px;margin:0 auto;display:flex;flex-direction:column;overflow:hidden;background:#0c0816;color:#ddd0f0;border:1px solid #3a1a5a;border-radius:12px;box-shadow:0 6px 30px rgba(0,0,0,.7);font:13px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif}',
+      '.pn{position:absolute;top:max(8px,env(safe-area-inset-top,0px));left:max(6px,env(safe-area-inset-left,0px));right:max(6px,env(safe-area-inset-right,0px));max-height:calc(100% - max(8px,env(safe-area-inset-top,0px)) - max(8px,env(safe-area-inset-bottom,0px)));max-width:520px;margin:0 auto;display:flex;flex-direction:column;overflow:hidden;background:#0c0816;color:#ddd0f0;border:1px solid #3a1a5a;border-radius:12px;box-shadow:0 6px 30px rgba(0,0,0,.7);font:13px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif}',
       '.hd{display:flex;align-items:center;gap:6px;padding:8px 8px 8px 12px;background:#140c20;border-bottom:1px solid #3a1a5a;flex:0 0 auto}',
       '.ttl{flex:1;font-weight:700;color:#c080f0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ttl small{color:#6a4a80;font-weight:400;margin-left:6px;font-size:11px}',
       'button{font:inherit;color:inherit;cursor:pointer}',
@@ -2226,10 +2255,10 @@
       '.gm.hi{border-color:#6a2a9a;background:#16082a}',
       '.gn{display:flex;align-items:baseline;justify-content:space-between;gap:4px;flex-wrap:nowrap}',
       '.gnm{font-weight:600;color:#c080f0;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1 1 0}',
-      '.gid{font-size:10px;color:#4a3060;flex-shrink:0;font-weight:400;white-space:nowrap}',
+      '.gid{font-size:10px;color:#7a6090;flex-shrink:0;font-weight:400;white-space:nowrap}',
       '.gx{font-size:11px;color:#8060a0;margin-top:2px}',
-      '.ga{font-size:11px;color:#4a3060;margin-top:1px}',
-      '.ge{font-size:10px;color:#6a4a7a;font-style:italic}',
+      '.ga{font-size:11px;color:#6a5080;margin-top:1px}',
+      '.ge{font-size:10px;color:#7a5a8a;font-style:italic}',
       '.gl{display:flex;gap:5px;margin-top:5px}',
       '.gl a{flex:1;padding:5px 2px;text-align:center;border-radius:5px;border:1px solid #3a1a5a;background:#0c0420;color:#9070b0;font-size:11px;font-weight:600;text-decoration:none;touch-action:manipulation;-webkit-tap-highlight-color:transparent;display:block;cursor:pointer}',
       '.gl a.dis{opacity:.35;pointer-events:none;cursor:default}',
@@ -2250,9 +2279,9 @@
       '.dwp{display:inline-block;min-width:26px;height:16px;border-radius:8px;text-align:center;font-size:9px;font-weight:700;line-height:16px;padding:0 4px;margin-right:4px;background:#2a1040;color:#c080f0}',
       '.dwp.hi{background:#4a1020;color:#f08080}',
       '.dwn{font-weight:600;color:#c080f0;font-size:12px}',
-      '.dwid{font-size:10px;color:#4a3060;margin-left:3px}',
+      '.dwid{font-size:10px;color:#7a6090;margin-left:3px}',
       '.dwx{font-size:11px;color:#8060a0;margin-top:2px}',
-      '.dwst{font-size:10px;color:#6a4a7a;margin-top:1px}',
+      '.dwst{font-size:10px;color:#8060a0;margin-top:1px}',
       '.dwst.ok{color:#5cb85c}',
       '.dwst.ho{color:#c09040}',
       '.dwrsn{font-size:10px;color:#a070c0;margin-top:2px;font-style:italic}',
@@ -2269,7 +2298,7 @@
       '.dw-cfg input[type=checkbox]{width:13px;height:13px;accent-color:#8040c0;cursor:pointer}',
       '.dw-cfg input[type=password]{max-width:130px;padding:3px 6px;border-radius:4px;border:1px solid #3a1a5a;background:#080410;color:#ddd0f0;font:10px inherit}',
       '.dw-cfg input[type=text]{width:60px;padding:3px 6px;border-radius:4px;border:1px solid #3a1a5a;background:#080410;color:#ddd0f0;font:10px inherit}',
-      '.dw-cnt{font-size:10px;color:#3a2050;padding:4px 0 2px;text-align:right}',
+      '.dw-cnt{font-size:10px;color:#6a4a80;padding:4px 0 2px}',
       '.dwnt{color:#7a5090;font-variant-numeric:tabular-nums}',
       '.dw-hist{margin-top:4px;padding-top:4px;border-top:1px solid #1e1030;font-size:10px;color:#5a4070}',
       '.dw-hist-item{padding:2px 0;display:flex;gap:5px;align-items:baseline;flex-wrap:wrap}',
@@ -2277,7 +2306,13 @@
       '.dw-hist-oc{color:#5cb85c}',
       '.dw-hist-oc.L{color:#c06070}',
       '.dw-hist-oc.T{color:#6070a0}',
-      '.dw-empty{font-size:11px;color:#3a2050;padding:8px 0;text-align:center}',
+      '.dw-empty{font-size:11px;color:#6a4a7a;padding:8px 0;text-align:center}',
+      /* hospital / inactive subsection */
+      '.dw-hosp-wrap{margin-top:5px;padding-top:4px;border-top:1px solid #1e1030}',
+      '.dw-hosp-tgl{display:flex;width:100%;align-items:center;justify-content:space-between;padding:4px 7px;border-radius:5px;border:1px solid #2a1a3a;background:#0a0418;color:#6a4a6a;font-size:10px;font-weight:600;cursor:pointer;touch-action:manipulation}',
+      '.dw-hosp-badge{font-size:9px;background:#1a1a3a;border-radius:8px;padding:1px 5px;color:#6a6090;margin-left:2px}',
+      '.dw-hosp-lbl{font-size:9px;color:#7a5040;margin-left:5px;font-style:italic}',
+      '.dw-hosp-body{padding-top:3px}',
       '.dw-exp-row{display:flex;gap:4px;flex-wrap:wrap;margin-top:5px;padding-top:4px;border-top:1px solid #1e1030}',
       /* collapsible History & Diagnostics */
       '.dh-wrap{margin-top:6px;padding-top:5px;border-top:1px solid #2a1040}',
@@ -2309,20 +2344,22 @@
       if (!host || !host.isConnected || !$bd) return;
       const now = Date.now();
       const games = Array.from(State.games.values());
-      /* v1.1.1: effective threshold = max(Min Bet, Min Watch Bet) applied to all display/eligibility paths */
-      var _eff = Math.max(State.minBet, State.dwWatchMin);
+      /* v1.1.2: Min Bet = lobby display only; Min Watch Bet = DW/engine only */
+      var _lobbyMin = State.minBet;
+      var _dwMin    = State.dwWatchMin;
       games.sort((a, b) => {
         if (a.bet == null && b.bet != null) return 1;
         if (a.bet != null && b.bet == null) return -1;
         if (a.bet !== b.bet) return (b.bet || 0) - (a.bet || 0);
         return (a.firstSeen || 0) - (b.firstSeen || 0);
       });
-      var dispGames = _eff > 0 ? games.filter(function(g) { return g.bet == null || g.bet >= _eff; }) : games;
+      var dispGames = _lobbyMin > 0 ? games.filter(function(g) { return g.bet == null || g.bet >= _lobbyMin; }) : games;
       let html = '';
 
+      var _filteredCnt = games.length - dispGames.length;
       html += '<div class="bar"><span class="dot ' + (State.tracking ? 'on' : 'off') + '"></span>';
-      html += '<strong style="color:#c080f0">' + dispGames.length + '</strong>&nbsp;game' + (dispGames.length !== 1 ? 's' : '') + ' observed';
-      if (dispGames.length < games.length) html += '&nbsp;&middot;&nbsp;' + (games.length - dispGames.length) + ' below min bet';
+      html += '<strong style="color:#c080f0">' + dispGames.length + '</strong>&nbsp;eligible';
+      if (_filteredCnt > 0) html += '&nbsp;&middot;&nbsp;' + _filteredCnt + '&nbsp;filtered';
       html += '</div>';
 
       if (State.parseOk === false) {
@@ -2335,7 +2372,7 @@
         html += '<div class="empty">All observed games are below your minimum bet.</div>';
       } else {
         for (const g of dispGames) {
-          const hi       = g.bet != null && g.bet >= _eff;
+          const hi       = g.bet != null && g.bet >= _lobbyMin;
           const profURL  = tornProfileURL(g.playerId);
           const atkURL   = tornAttackURL(g.playerId);
           html += '<div class="gm' + (hi ? ' hi' : '') + '">';
@@ -2346,11 +2383,16 @@
           /* Bet row */
           html += '<div class="gx">Bet:&nbsp;<span' + (hi ? ' class="ok"' : '') + '>' + esc(fmtBet(g.bet)) + '</span>';
           if (g.playerCount != null) html += '&nbsp;&middot;&nbsp;Players:&nbsp;' + g.playerCount;
-          if (g.gameId) html += '&nbsp;&middot;&nbsp;<span style="color:#3a2050;font-size:10px">Game:' + esc(g.gameId) + '</span>';
+          if (g.gameId) html += '&nbsp;&middot;&nbsp;<span style="color:#6a4a7a;font-size:10px">Game:' + esc(g.gameId) + '</span>';
           html += '</div>';
-          /* Age + countdown */
-          html += '<div class="ga">Observed: ' + esc(formatAge(g.firstSeen, now)) + '</div>';
-          html += '<div class="ge" id="rrmt-tm-' + esc(g.gameKey) + '">Est. remaining (\u224815 min, not guaranteed): ' + esc(formatCountdown(g.firstSeen, now)) + '</div>';
+          /* Age + countdown — single note when age unknown to avoid duplicate "Age unknown" */
+          if (g.firstSeen == null) {
+            html += '<div class="ga">Game age unknown \u2014 timer unavailable</div>';
+            html += '<div class="ge" id="rrmt-tm-' + esc(g.gameKey) + '" style="display:none"></div>';
+          } else {
+            html += '<div class="ga">Observed: ' + esc(formatAge(g.firstSeen, now)) + '</div>';
+            html += '<div class="ge" id="rrmt-tm-' + esc(g.gameKey) + '">Est. remaining (\u224815 min, not guaranteed): ' + esc(formatCountdown(g.firstSeen, now)) + '</div>';
+          }
           /* Profile / Attack tap links — disabled if playerId is invalid */
           html += '<div class="gl">';
           html += '<a' + (profURL ? ' href="' + esc(profURL) + '"' : '') + ' target="_blank" rel="noopener noreferrer" aria-label="Profile" title="View profile" class="prf' + (profURL ? '' : ' dis') + '">\uD83D\uDC64</a>';
@@ -2363,99 +2405,132 @@
       /* ── Disappearance Watch ── */
       var dwCands    = DisappearanceEngine.getCandidates();
       var dwHist     = DisappearanceEngine.getHistory();
-      /* v1.1.1: DW display also uses effective threshold */
-      var dwFiltered = _eff > 0
-        ? dwCands.filter(function (c) { return c.bet == null || c.bet >= _eff; })
+      /* v1.1.2: DW display uses dwWatchMin only */
+      var dwFiltered = _dwMin > 0
+        ? dwCands.filter(function (c) { return c.bet == null || c.bet >= _dwMin; })
         : dwCands;
+      var dwActive = dwFiltered.filter(function (c) { return c.state !== 'HOSPITAL'; });
+      var dwHosp   = dwFiltered.filter(function (c) { return c.state === 'HOSPITAL'; });
+
       html += '<div class="dws">';
       html += '<div class="dwsh">\uD83D\uDC41 Disappearance Watch';
-      if (dwCands.length) html += '<span class="dwsc">' + dwCands.length + '</span>';
+      if (dwActive.length) html += '<span class="dwsc">' + dwActive.length + '</span>';
+      if (dwHosp.length)   html += '<span class="dw-hosp-badge">' + dwHosp.length + '\u00a0hosp</span>';
       html += '</div>';
+
+      function _renderDwCard(dc, isHospCard) {
+        var isAct = !isHospCard && dc.priority >= 60;
+        var cardCls = isHospCard ? ' sup' : (isAct ? ' act' : '');
+        var s = '<div class="dwc' + cardCls + '">';
+        /* Name + priority badge */
+        s += '<div>';
+        s += '<span class="dwp' + (isAct ? ' hi' : '') + '">' + dc.priority + '</span>';
+        s += '<span class="dwn">' + esc(dc.playerName) + '</span>';
+        s += '<span class="dwid">#' + esc(dc.playerId) + '</span>';
+        if (isHospCard) s += '<span class="dw-hosp-lbl">In hospital</span>';
+        s += '</div>';
+        /* Bet + game */
+        s += '<div class="dwx">Bet:&nbsp;' + esc(fmtBet(dc.bet));
+        if (dc.gameId) s += '&nbsp;&middot;&nbsp;Game:&nbsp;' + esc(dc.gameId);
+        s += '</div>';
+        /* Time info — elapsed uses a live span updated by tickDwTimers each second */
+        var dwElapsed = dc.confirmedTs ? formatAge(dc.confirmedTs, now) : '?';
+        var dwElapsedAttr = dc.confirmedTs ? ' data-rrmt-dw-elapsed="' + dc.confirmedTs + '"' : '';
+        var dwObsHtml = '';
+        if (dc.firstSeen != null) {
+          dwObsHtml = '&nbsp;&middot;&nbsp;Observed:&nbsp;' + esc(formatAge(dc.firstSeen, now));
+        }
+        /* Next scheduled check */
+        var dwNextTs = null;
+        for (var nci = 0; nci < dc.statusChecks.length; nci++) {
+          var ncs = dc.statusChecks[nci];
+          if (ncs.result === null && ncs.scheduledAt !== null) {
+            if (dwNextTs === null || ncs.scheduledAt < dwNextTs) dwNextTs = ncs.scheduledAt;
+          }
+        }
+        var dwNextHtml = '';
+        if (dwNextTs !== null && State.statusEnabled && StatusChecker.canCheck()) {
+          var dwNextAttr = ' data-rrmt-dw-next="' + dwNextTs + '"';
+          dwNextHtml = '&nbsp;&middot;&nbsp;Next:&nbsp;<span class="dwnt"' + dwNextAttr + '>' +
+                       esc(formatCountdownTo(dwNextTs, now)) + '</span>';
+        }
+        s += '<div class="dwx">Gone\u00a0for:&nbsp;<span' + dwElapsedAttr + '>' + esc(dwElapsed) +
+             '</span>' + dwObsHtml + dwNextHtml + '</div>';
+        /* Status */
+        var dwStCls = dc.latestStatus === 'Okay' ? 'ok' : dc.latestStatus === 'Hospital' ? 'ho' : '';
+        s += '<div class="dwst ' + dwStCls + '">';
+        if (!State.statusEnabled) {
+          s += 'Status: checks disabled';
+        } else if (dc.latestStatus) {
+          var dwStAge = dc.latestStatusTs ? ('&nbsp;(' + esc(formatAge(dc.latestStatusTs, now)) + ' ago)') : '';
+          var dwStatusLabel = (dc.latestStatus === 'Hospital' && dc.hospitalLabel)
+            ? dc.hospitalLabel : dc.latestStatus;
+          s += 'Status:&nbsp;<strong>' + esc(dwStatusLabel) + '</strong>' + dwStAge;
+        } else if (StatusChecker.canCheck()) {
+          s += 'Status: pending';
+        } else {
+          s += 'Status: no API key';
+        }
+        s += '</div>';
+        /* Priority reason */
+        if (dc.priorityReason) {
+          s += '<div class="dwrsn">' + esc(dc.priorityReason) + '</div>';
+        }
+        /* Action row */
+        var dwProfURL = tornProfileURL(dc.playerId);
+        var dwAtkURL  = tornAttackURL(dc.playerId);
+        s += '<div class="dwbr">';
+        s += '<a' + (dwProfURL ? ' href="' + esc(dwProfURL) + '"' : '') +
+             ' target="_blank" rel="noopener noreferrer"' +
+             ' aria-label="Profile" title="View profile"' +
+             ' class="prf ico' + (dwProfURL ? '' : ' dis') + '">\uD83D\uDC64</a>';
+        s += '<a' + (dwAtkURL ? ' href="' + esc(dwAtkURL) + '"' : '') +
+             ' target="_blank" rel="noopener noreferrer"' +
+             ' aria-label="Attack" title="Attack player"' +
+             ' class="atk ico' + (dwAtkURL ? '' : ' dis') + '">\u2694\uFE0F</a>';
+        s += '<button class="dsm" data-dw-dismiss="' + esc(dc.gameId) + '">Dismiss</button>';
+        var ocLabels = [['Won','W'],['Lost','L'],['Timeout','T'],['Unknown','?']];
+        for (var oi = 0; oi < ocLabels.length; oi++) {
+          var oLabel = ocLabels[oi][0], oShort = ocLabels[oi][1];
+          var oSel   = dc.outcome === oLabel ? ' sel' : '';
+          s += '<button class="oc' + oSel + '" data-dw-outcome="' + esc(dc.gameId) +
+               '" data-dw-label="' + oLabel + '" title="' + oLabel + '">' + oShort + '</button>';
+        }
+        s += '</div>';
+        s += '</div>'; /* /dwc */
+        return s;
+      }
 
       if (!dwCands.length) {
         html += '<div class="dw-empty">No confirmed disappearances yet</div>';
       } else if (!dwFiltered.length) {
-        html += '<div class="dw-cnt">Showing 0 of ' + dwCands.length + ' disappeared game' + (dwCands.length !== 1 ? 's' : '') + '</div>';
-        html += '<div class="dw-empty">No disappeared games above your minimum bet.</div>';
+        html += '<div class="dw-cnt">0 watched&nbsp;&middot;&nbsp;' + dwCands.length + ' total disappeared</div>';
+        html += '<div class="dw-empty">No disappeared games above your min watch bet.</div>';
       } else {
-        html += '<div class="dw-cnt">Showing ' + dwFiltered.length + ' of ' + dwCands.length + ' disappeared game' + (dwCands.length !== 1 ? 's' : '') + '</div>';
-        for (var di = 0; di < dwFiltered.length; di++) {
-          var dc = dwFiltered[di];
-          var isAct = dc.priority >= 60;
-          var isSup = dc.state === 'HOSPITAL';
-          html += '<div class="dwc' + (isSup ? ' sup' : isAct ? ' act' : '') + '">';
-          /* Name + priority badge */
-          html += '<div>';
-          html += '<span class="dwp' + (isAct ? ' hi' : '') + '">' + dc.priority + '</span>';
-          html += '<span class="dwn">' + esc(dc.playerName) + '</span>';
-          html += '<span class="dwid">#' + esc(dc.playerId) + '</span>';
-          html += '</div>';
-          /* Bet + game */
-          html += '<div class="dwx">Bet:&nbsp;' + esc(fmtBet(dc.bet));
-          if (dc.gameId) html += '&nbsp;&middot;&nbsp;Game:&nbsp;' + esc(dc.gameId);
-          html += '</div>';
-          /* Time info — elapsed uses a live span updated by tickDwTimers each second */
-          var dwElapsed = dc.confirmedTs ? formatAge(dc.confirmedTs, now) : '?';
-          var dwObs     = formatAge(dc.firstSeen, now);
-          var dwElapsedAttr = dc.confirmedTs ? ' data-rrmt-dw-elapsed="' + dc.confirmedTs + '"' : '';
-          /* Next scheduled check */
-          var dwNextTs = null;
-          for (var nci = 0; nci < dc.statusChecks.length; nci++) {
-            var ncs = dc.statusChecks[nci];
-            if (ncs.result === null && ncs.scheduledAt !== null) {
-              if (dwNextTs === null || ncs.scheduledAt < dwNextTs) dwNextTs = ncs.scheduledAt;
+        if (dwFiltered.length < dwCands.length) {
+          html += '<div class="dw-cnt">' + dwFiltered.length + ' watched&nbsp;&middot;&nbsp;' + dwCands.length + ' total disappeared</div>';
+        }
+        /* Active (non-hospital) candidates */
+        if (!dwActive.length) {
+          html += '<div class="dw-empty">All tracked players are currently in hospital.</div>';
+        } else {
+          for (var di = 0; di < dwActive.length; di++) {
+            html += _renderDwCard(dwActive[di], false);
+          }
+        }
+        /* Hospital / Inactive collapsed subsection */
+        if (dwHosp.length) {
+          html += '<div class="dw-hosp-wrap">';
+          html += '<button class="dw-hosp-tgl" id="rrmt-dw-hosp-tgl">\uD83C\uDFE5\u00a0Hospital\u00a0/\u00a0Inactive\u00a0(' +
+                  dwHosp.length + ')&nbsp;' + (State.dwHospOpen ? '\u25B2' : '\u25BC') + '</button>';
+          if (State.dwHospOpen) {
+            html += '<div class="dw-hosp-body">';
+            for (var hj = 0; hj < dwHosp.length; hj++) {
+              html += _renderDwCard(dwHosp[hj], true);
             }
-          }
-          var dwNextHtml = '';
-          if (dwNextTs !== null && State.statusEnabled && StatusChecker.canCheck()) {
-            var dwNextAttr = ' data-rrmt-dw-next="' + dwNextTs + '"';
-            dwNextHtml = '&nbsp;&middot;&nbsp;Next:&nbsp;<span class="dwnt"' + dwNextAttr + '>' +
-                         esc(formatCountdownTo(dwNextTs, now)) + '</span>';
-          }
-          html += '<div class="dwx">Gone:&nbsp;<span' + dwElapsedAttr + '>' + esc(dwElapsed) +
-                  '</span>&nbsp;&middot;&nbsp;Observed:&nbsp;' + esc(dwObs) + dwNextHtml + '</div>';
-          /* Status — show hospital classification label instead of bare "Hospital" */
-          var dwStCls = dc.latestStatus === 'Okay' ? 'ok' : dc.latestStatus === 'Hospital' ? 'ho' : '';
-          html += '<div class="dwst ' + dwStCls + '">';
-          if (!State.statusEnabled) {
-            html += 'Status: checks disabled';
-          } else if (dc.latestStatus) {
-            var dwStAge = dc.latestStatusTs ? ('&nbsp;(' + esc(formatAge(dc.latestStatusTs, now)) + ' ago)') : '';
-            var dwStatusLabel = (dc.latestStatus === 'Hospital' && dc.hospitalLabel)
-              ? dc.hospitalLabel : dc.latestStatus;
-            html += 'Status:&nbsp;<strong>' + esc(dwStatusLabel) + '</strong>' + dwStAge;
-          } else if (StatusChecker.canCheck()) {
-            html += 'Status: checking\u2026';
-          } else {
-            html += 'Status: no API key';
+            html += '</div>';
           }
           html += '</div>';
-          /* Priority reason */
-          if (dc.priorityReason) {
-            html += '<div class="dwrsn">' + esc(dc.priorityReason) + '</div>';
-          }
-          /* Action row */
-          var dwProfURL = tornProfileURL(dc.playerId);
-          var dwAtkURL  = tornAttackURL(dc.playerId);
-          html += '<div class="dwbr">';
-          html += '<a' + (dwProfURL ? ' href="' + esc(dwProfURL) + '"' : '') +
-                  ' target="_blank" rel="noopener noreferrer"' +
-                  ' aria-label="Profile" title="View profile"' +
-                  ' class="prf ico' + (dwProfURL ? '' : ' dis') + '">\uD83D\uDC64</a>';
-          html += '<a' + (dwAtkURL ? ' href="' + esc(dwAtkURL) + '"' : '') +
-                  ' target="_blank" rel="noopener noreferrer"' +
-                  ' aria-label="Attack" title="Attack player"' +
-                  ' class="atk ico' + (dwAtkURL ? '' : ' dis') + '">\u2694\uFE0F</a>';
-          html += '<button class="dsm" data-dw-dismiss="' + esc(dc.gameId) + '">Dismiss</button>';
-          var ocLabels = [['Won','W'],['Lost','L'],['Timeout','T'],['Unknown','?']];
-          for (var oi = 0; oi < ocLabels.length; oi++) {
-            var oLabel = ocLabels[oi][0], oShort = ocLabels[oi][1];
-            var oSel   = dc.outcome === oLabel ? ' sel' : '';
-            html += '<button class="oc' + oSel + '" data-dw-outcome="' + esc(dc.gameId) +
-                    '" data-dw-label="' + oLabel + '">' + oShort + '</button>';
-          }
-          html += '</div>';
-          html += '</div>'; /* /dwc */
         }
       }
 
@@ -2470,7 +2545,7 @@
       } else if (State.statusEnabled && pdaKeyLive) {
         html += '<span style="color:#5cb85c;font-size:9px">\u2713 PDA key active</span>';
       }
-      html += '<label style="margin-left:6px;flex-shrink:0">Min Watch Bet:&nbsp;' +
+      html += '<label style="margin-left:6px;flex-shrink:0" title="Games below this amount are not tracked for disappearance">Min Watch:&nbsp;' +
               '<input id="rrmt-dw-mb" type="text" size="6" value="' +
               esc(fmtBet(State.dwWatchMin)) + '" placeholder="e.g.\u202F50M">' +
               '</label>';
@@ -2478,7 +2553,7 @@
 
       html += '</div>'; /* /dws */
 
-      html += '<div class="cfg"><label>Min bet:&nbsp;<input id="rrmt-mb" type="text" value="' + esc(fmtBet(State.minBet)) + '" placeholder="e.g. 200M"></label></div>';
+      html += '<div class="cfg"><label title="Hides games below this amount from the main list">Min Bet (lobby):&nbsp;<input id="rrmt-mb" type="text" value="' + esc(fmtBet(State.minBet)) + '" placeholder="e.g. 200M"></label></div>';
 
       /* History & Diagnostics — collapsible, collapsed by default */
       html += '<div class="dh-wrap">';
@@ -2737,6 +2812,12 @@
           PersistenceStore.savePref(DW_PREF_KEY, v);
           render();
         }
+      });
+
+      const hospTglEl = shadow.getElementById('rrmt-dw-hosp-tgl');
+      if (hospTglEl) hospTglEl.addEventListener('click', function () {
+        State.dwHospOpen = !State.dwHospOpen;
+        render();
       });
 
       const lbEl = shadow.getElementById('rrmt-lb');
