@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RR Mug Tracker
 // @namespace    fatboy.torn
-// @version      1.0.0
+// @version      1.1.0
 // @description  Russian Roulette lobby tracker with disappearance-watch intelligence for Torn PDA (iOS) and desktop.
 // @author       FATBOY [572123]
 // @match        https://www.torn.com/page.php*
@@ -13,6 +13,29 @@
 // ==/UserScript==
 
 /*
+ * RR Mug Tracker v1.1.0 — Status checks ON by default, Min Watch Bet eligibility gate, collapsible History &
+ *   Diagnostics panel, compact icon action buttons.
+ *
+ * v1.1.0 changes:
+ *   - Status checks default to ON for new installs and PDA users.  Saved OFF preference is respected.
+ *     Preference persisted via PersistenceStore using STATUS_PREF_KEY ("rrmt_status_pref").
+ *   - Min Watch Bet is now an eligibility gate for active watch entries, not just a display filter.
+ *     Games with known bets below the threshold are not confirmed, not API-checked and not displayed.
+ *     getDueChecks() enforces the threshold to stop checks for entries confirmed before a raise.
+ *     Raising the threshold: stops further API checks for newly ineligible games.
+ *     Lowering the threshold: does not retroactively schedule checks for previously skipped games.
+ *     Null-bet games are always eligible regardless of threshold.  History retained for data integrity.
+ *   - History and Diagnostics sections wrapped in a single collapsible "History & Diagnostics" panel,
+ *     collapsed by default.  State.diagHistOpen persists the toggle.  Auto-expands when export or
+ *     diagnostics output is generated.  All data, handlers and exports are unaffected.
+ *   - Profile and Attack text links on Disappearance Watch cards replaced with compact icon buttons
+ *     (👤 / ⚔) with aria-label and title attributes.  Touch targets enlarged to iOS-safe minimum.
+ *     Lobby game cards updated to match for visual consistency.
+ *   - Suite X added: 14 regression tests (X1–X14) covering new v1.1.0 behaviour.
+ *   - V-suite shared setup updated to confirm games at dwWatchMin=0 so filter behaviour tests remain
+ *     meaningful after the confirmation-gate change.
+ *   - W19 updated to reflect getDueChecks() now honouring the eligibility threshold.
+ *
  * RR Mug Tracker v1.0.0 — Hospital classification, live timers, reliable status checks, BUSTR-inspired scoring.
  *
  * v1.0.0 changes:
@@ -321,7 +344,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.0.0';
+  const VERSION = '1.1.0';
   if (window.top !== window.self) return;
 
   /* isRRPage accepts optional (pn, qs) args for test-harness use */
@@ -365,6 +388,7 @@
   const DEFAULT_DW_MIN_BET      = 50000000;         /* $50M default watch display filter */
   const DE_INFLIGHT_TIMEOUT_MS  = 15000;            /* force-clear stalled _inFlight guard */
   const DE_RETRY_DELAY_MS       = 400;              /* delay before single transient retry */
+  const STATUS_PREF_KEY         = 'rrmt_status_pref'; /* saves user ON/OFF preference */
 
   /* Profile-link texts that are UI chrome, not player names */
   const UI_LABEL = /^(view\s+profile\.?|premium\s+data|follow|unfollow|report|trade|send\s+message|send\s+gift|bounty|add\s+to\s+friend)$/i;
@@ -379,9 +403,10 @@
     minBet:        DEFAULT_MIN_BET,
     diagOutput:    null,       // set when user presses Copy DOM diagnostics
     diagMsg:       null,       // transient copy feedback message
-    statusEnabled: false,      // status checks opt-in (off by default)
+    statusEnabled: true,       // status checks ON by default; saved OFF preference overrides at boot
     apiKey:        '',         // user-entered API key for TM/VM (never logged)
-    dwHistOpen:    false,      // disappearance watch history panel open/closed
+    diagHistOpen:  false,      // collapsible History & Diagnostics panel open/closed
+    dwHistOpen:    false,      // disappearance watch history sub-list open/closed
     dwHistPage:    0,          // current history page (0-indexed)
     dwImportOpen:    false,    // import JSON pane visible
     dwImportError:   '',       // last import error message
@@ -1505,6 +1530,11 @@
              from confirming a game that may be in the middle of a React rerender */
           if (entry.candidateTs !== null &&
               (timestamp - entry.candidateTs) >= DE_CONFIRM_DEBOUNCE_MS) {
+            /* v1.1.0 eligibility gate: known bets below Min Watch Bet are not confirmed */
+            var _thresh = State.dwWatchMin;
+            if (_thresh > 0 && entry.bet !== null && entry.bet !== undefined && entry.bet < _thresh) {
+              return; /* below threshold — stay CANDIDATE, no watch entry created */
+            }
             entry.state       = 'CONFIRMED';
             entry.stateReason = 'Confirmed absent across ' + abs + ' valid scans';
             entry.confirmedTs = timestamp;
@@ -1578,9 +1608,12 @@
 
     function getDueChecks(timestamp) {
       var due = [];
+      var _dqThresh = State.dwWatchMin;
       _watches.forEach(function (entry) {
         if (entry.state !== 'CONFIRMED') return;
         if (!entry.playerId || !/^\d+$/.test(entry.playerId)) return;
+        /* v1.1.0: skip entries below the current threshold (handles post-confirmation threshold raises) */
+        if (_dqThresh > 0 && entry.bet !== null && entry.bet !== undefined && entry.bet < _dqThresh) return;
         for (var i = 0; i < entry.statusChecks.length; i++) {
           var slot = entry.statusChecks[i];
           if (slot.result !== null) continue;
@@ -2207,6 +2240,7 @@
       '.dwrsn{font-size:10px;color:#a070c0;margin-top:2px;font-style:italic}',
       '.dwbr{display:flex;gap:4px;margin-top:5px;flex-wrap:wrap}',
       '.dwbr a,.dwbr button{padding:3px 8px;border-radius:4px;font-size:10px;font-weight:600;text-decoration:none;border:1px solid #3a1a5a;background:#0c0420;color:#9070b0;cursor:pointer;font-family:inherit;touch-action:manipulation;-webkit-tap-highlight-color:transparent}',
+      '.dwbr a.ico{font-size:14px;padding:4px 9px;min-width:34px;min-height:28px;display:inline-flex;align-items:center;justify-content:center;line-height:1}',
       '.dwbr a.atk{border-color:#4a1a2a;color:#c06070}',
       '.dwbr .dis{opacity:.35;pointer-events:none}',
       '.dwbr .dsm{color:#4a3060}',
@@ -2227,6 +2261,10 @@
       '.dw-hist-oc.T{color:#6070a0}',
       '.dw-empty{font-size:11px;color:#3a2050;padding:8px 0;text-align:center}',
       '.dw-exp-row{display:flex;gap:4px;flex-wrap:wrap;margin-top:5px;padding-top:4px;border-top:1px solid #1e1030}',
+      /* collapsible History & Diagnostics */
+      '.dh-wrap{margin-top:6px;padding-top:5px;border-top:1px solid #2a1040}',
+      '.dh-tgl{display:flex;width:100%;align-items:center;justify-content:space-between;padding:5px 8px;border-radius:6px;border:1px solid #3a1a5a;background:#100820;color:#8060a0;font-size:10px;font-weight:700;text-align:left;cursor:pointer;touch-action:manipulation}',
+      '.dh-body{padding-top:4px}',
       '.dw-imp{margin-top:4px}',
       '.dw-imp textarea{display:block;width:100%;height:90px;background:#040110;color:#9080c0;border:1px solid #2a1040;border-radius:4px;font:10px/1.3 "Courier New",monospace;padding:5px;resize:none;-webkit-user-select:text;user-select:text}',
       '.dw-imp-err{font-size:10px;color:#f06060;margin-bottom:3px}',
@@ -2293,8 +2331,8 @@
           html += '<div class="ge" id="rrmt-tm-' + esc(g.gameKey) + '">Est. remaining (\u224815 min, not guaranteed): ' + esc(formatCountdown(g.firstSeen, now)) + '</div>';
           /* Profile / Attack tap links — disabled if playerId is invalid */
           html += '<div class="gl">';
-          html += '<a' + (profURL ? ' href="' + esc(profURL) + '"' : '') + ' target="_blank" rel="noopener noreferrer" class="prf' + (profURL ? '' : ' dis') + '">Profile</a>';
-          html += '<a' + (atkURL  ? ' href="' + esc(atkURL)  + '"' : '') + ' target="_blank" rel="noopener noreferrer" class="atk' + (atkURL  ? '' : ' dis') + '">Attack</a>';
+          html += '<a' + (profURL ? ' href="' + esc(profURL) + '"' : '') + ' target="_blank" rel="noopener noreferrer" aria-label="Profile" title="View profile" class="prf' + (profURL ? '' : ' dis') + '">\uD83D\uDC64</a>';
+          html += '<a' + (atkURL  ? ' href="' + esc(atkURL)  + '"' : '') + ' target="_blank" rel="noopener noreferrer" aria-label="Attack" title="Attack player" class="atk' + (atkURL  ? '' : ' dis') + '">\u2694\uFE0F</a>';
           html += '</div>';
           html += '</div>';
         }
@@ -2379,10 +2417,12 @@
           html += '<div class="dwbr">';
           html += '<a' + (dwProfURL ? ' href="' + esc(dwProfURL) + '"' : '') +
                   ' target="_blank" rel="noopener noreferrer"' +
-                  ' class="prf' + (dwProfURL ? '' : ' dis') + '">Profile</a>';
+                  ' aria-label="Profile" title="View profile"' +
+                  ' class="prf ico' + (dwProfURL ? '' : ' dis') + '">\uD83D\uDC64</a>';
           html += '<a' + (dwAtkURL ? ' href="' + esc(dwAtkURL) + '"' : '') +
                   ' target="_blank" rel="noopener noreferrer"' +
-                  ' class="atk' + (dwAtkURL ? '' : ' dis') + '">Attack</a>';
+                  ' aria-label="Attack" title="Attack player"' +
+                  ' class="atk ico' + (dwAtkURL ? '' : ' dis') + '">\u2694\uFE0F</a>';
           html += '<button class="dsm" data-dw-dismiss="' + esc(dc.gameId) + '">Dismiss</button>';
           var ocLabels = [['Won','W'],['Lost','L'],['Timeout','T'],['Unknown','?']];
           for (var oi = 0; oi < ocLabels.length; oi++) {
@@ -2413,93 +2453,105 @@
               '</label>';
       html += '</div>';
 
-      /* History — paginated, accurate count */
-      html += '<div class="dw-hist">';
-      html += '<strong>' + dwHist.length + ' in history</strong>';
-      html += '&nbsp;<button class="lbtn" id="rrmt-dw-hist-tgl">' +
-              (State.dwHistOpen ? '\u25B2 Hide' : '\u25BC History') + '</button>';
-      if (State.dwHistOpen && dwHist.length > 0) {
-        var pageSize  = DE_HIST_PAGE_SIZE;
-        var pageCount = Math.max(1, Math.ceil(dwHist.length / pageSize));
-        var page      = Math.min(Math.max(0, State.dwHistPage), pageCount - 1);
-        var hStart    = page * pageSize;
-        var showH     = dwHist.slice(hStart, hStart + pageSize);
-        for (var hi = 0; hi < showH.length; hi++) {
-          var hc = showH[hi];
-          var ocCls = hc.outcome === 'Won' ? '' : hc.outcome === 'Lost' ? ' L' : ' T';
-          html += '<div class="dw-hist-item">';
-          html += '<span class="dw-hist-nm">' + esc(hc.playerName || '') + ' (' + esc(hc.gameId) + ')</span>';
-          html += '<span>' + esc(hc.state) + '</span>';
-          if (hc.outcome) html += '<span class="dw-hist-oc' + ocCls + '">' + esc(hc.outcome) + '</span>';
-          html += '</div>';
-        }
-        if (pageCount > 1) {
-          html += '<div style="display:flex;gap:4px;margin-top:3px;align-items:center;font-size:10px;color:#6a4a7a">';
-          html += '<button class="lbtn" id="rrmt-dw-hist-prev"' + (page === 0 ? ' disabled' : '') + '>&laquo;</button>';
-          html += '<span>' + (page + 1) + '\u202F/\u202F' + pageCount + '</span>';
-          html += '<button class="lbtn" id="rrmt-dw-hist-next"' + (page >= pageCount - 1 ? ' disabled' : '') + '>&raquo;</button>';
-          html += '</div>';
-        }
-      }
-      html += '</div>';
-
-      /* Export / Import row */
-      html += '<div class="dw-exp-row">';
-      html += '<button class="lbtn" id="rrmt-dw-exp-json">Export JSON</button>';
-      html += '<button class="lbtn" id="rrmt-dw-exp-csv">Export CSV</button>';
-      html += '<button class="lbtn" id="rrmt-dw-imp-tgl">' + (State.dwImportOpen ? 'Cancel' : 'Import JSON') + '</button>';
-      if (PersistenceStore.isAvailable()) {
-        html += '<span style="font-size:9px;color:#5a8060;margin-left:2px">\u2713&nbsp;saved</span>';
-      }
-      if (State.dwImportSuccess) {
-        html += '<span style="font-size:9px;color:#5cb85c;margin-left:2px">' + esc(State.dwImportSuccess) + '</span>';
-      }
-      html += '</div>';
-
-      /* Import textarea — visible when dwImportOpen */
-      if (State.dwImportOpen) {
-        html += '<div class="dw-imp">';
-        if (State.dwImportError) {
-          html += '<div class="dw-imp-err">' + esc(State.dwImportError) + '</div>';
-        }
-        html += '<textarea id="rrmt-dw-imp-ta" placeholder="Paste exported JSON here\u2026"></textarea>';
-        html += '<div style="display:flex;gap:4px;margin-top:3px">';
-        html += '<button class="lbtn" id="rrmt-dw-imp-apply">Apply Import</button>';
-        html += '</div>';
-        html += '</div>';
-      }
-
       html += '</div>'; /* /dws */
 
-      /* Export output — always shown after export (mobile-safe: no download dependency) */
-      if (State.exportOutput) {
-        html += '<div class="dg-wrap">';
-        html += '<div class="dg-hd"><span>\uD83D\uDCE4 ' + esc(State.exportOutputFn || 'Export') + '</span>';
-        html += '<div style="display:flex;gap:4px">';
-        html += '<button class="lbtn" id="rrmt-exp-copy">Copy All</button>';
-        html += '<button class="lbtn" id="rrmt-exp-clr">\u2715 Clear</button>';
-        html += '</div></div>';
-        html += '<div class="dg-hint">Tap Copy All, or select all text below and copy</div>';
-        html += '<textarea class="dg-ta" id="rrmt-exp-ta" readonly></textarea>';
-        html += '</div>';
-      }
-
       html += '<div class="cfg"><label>Min bet:&nbsp;<input id="rrmt-mb" type="text" value="' + esc(fmtBet(State.minBet)) + '" placeholder="e.g. 200M"></label></div>';
-      html += '<button class="lbtn" id="rrmt-lb">Copy log (last 50)</button>';
-      html += '&nbsp;<button class="lbtn" id="rrmt-diag">Copy DOM diagnostics</button>';
 
-      /* diagnostic output area — only rendered when State.diagOutput is set */
-      if (State.diagOutput) {
-        html += '<div class="dg-wrap">';
-        html += '<div class="dg-hd"><span>\uD83D\uDD0D Diagnostics captured</span>';
-        html += '<button class="lbtn" id="rrmt-dgclr">\u2715 Clear</button></div>';
-        if (State.diagMsg) {
-          html += '<div class="dg-msg">' + esc(State.diagMsg) + '</div>';
+      /* History & Diagnostics — collapsible, collapsed by default */
+      html += '<div class="dh-wrap">';
+      html += '<button class="dh-tgl" id="rrmt-dh-tgl">History &amp; Diagnostics&nbsp;' +
+              (State.diagHistOpen ? '\u25B2' : '\u25BC') + '</button>';
+      if (State.diagHistOpen) {
+        html += '<div class="dh-body">';
+
+        /* History — paginated, accurate count */
+        html += '<div class="dw-hist">';
+        html += '<strong>' + dwHist.length + ' in history</strong>';
+        html += '&nbsp;<button class="lbtn" id="rrmt-dw-hist-tgl">' +
+                (State.dwHistOpen ? '\u25B2 Hide' : '\u25BC History') + '</button>';
+        if (State.dwHistOpen && dwHist.length > 0) {
+          var pageSize  = DE_HIST_PAGE_SIZE;
+          var pageCount = Math.max(1, Math.ceil(dwHist.length / pageSize));
+          var page      = Math.min(Math.max(0, State.dwHistPage), pageCount - 1);
+          var hStart    = page * pageSize;
+          var showH     = dwHist.slice(hStart, hStart + pageSize);
+          for (var hi = 0; hi < showH.length; hi++) {
+            var hc = showH[hi];
+            var ocCls = hc.outcome === 'Won' ? '' : hc.outcome === 'Lost' ? ' L' : ' T';
+            html += '<div class="dw-hist-item">';
+            html += '<span class="dw-hist-nm">' + esc(hc.playerName || '') + ' (' + esc(hc.gameId) + ')</span>';
+            html += '<span>' + esc(hc.state) + '</span>';
+            if (hc.outcome) html += '<span class="dw-hist-oc' + ocCls + '">' + esc(hc.outcome) + '</span>';
+            html += '</div>';
+          }
+          if (pageCount > 1) {
+            html += '<div style="display:flex;gap:4px;margin-top:3px;align-items:center;font-size:10px;color:#6a4a7a">';
+            html += '<button class="lbtn" id="rrmt-dw-hist-prev"' + (page === 0 ? ' disabled' : '') + '>&laquo;</button>';
+            html += '<span>' + (page + 1) + '\u202F/\u202F' + pageCount + '</span>';
+            html += '<button class="lbtn" id="rrmt-dw-hist-next"' + (page >= pageCount - 1 ? ' disabled' : '') + '>&raquo;</button>';
+            html += '</div>';
+          }
         }
-        html += '<div class="dg-hint">If copy failed: tap text area below \u2192 triple-tap \u2192 select all \u2192 copy</div>';
-        html += '<textarea class="dg-ta" id="rrmt-dgta" readonly></textarea>';
         html += '</div>';
+
+        /* Export / Import row */
+        html += '<div class="dw-exp-row">';
+        html += '<button class="lbtn" id="rrmt-dw-exp-json">Export JSON</button>';
+        html += '<button class="lbtn" id="rrmt-dw-exp-csv">Export CSV</button>';
+        html += '<button class="lbtn" id="rrmt-dw-imp-tgl">' + (State.dwImportOpen ? 'Cancel' : 'Import JSON') + '</button>';
+        if (PersistenceStore.isAvailable()) {
+          html += '<span style="font-size:9px;color:#5a8060;margin-left:2px">\u2713&nbsp;saved</span>';
+        }
+        if (State.dwImportSuccess) {
+          html += '<span style="font-size:9px;color:#5cb85c;margin-left:2px">' + esc(State.dwImportSuccess) + '</span>';
+        }
+        html += '</div>';
+
+        /* Import textarea — visible when dwImportOpen */
+        if (State.dwImportOpen) {
+          html += '<div class="dw-imp">';
+          if (State.dwImportError) {
+            html += '<div class="dw-imp-err">' + esc(State.dwImportError) + '</div>';
+          }
+          html += '<textarea id="rrmt-dw-imp-ta" placeholder="Paste exported JSON here\u2026"></textarea>';
+          html += '<div style="display:flex;gap:4px;margin-top:3px">';
+          html += '<button class="lbtn" id="rrmt-dw-imp-apply">Apply Import</button>';
+          html += '</div>';
+          html += '</div>';
+        }
+
+        /* Export output — shown after export (mobile-safe: no download dependency) */
+        if (State.exportOutput) {
+          html += '<div class="dg-wrap">';
+          html += '<div class="dg-hd"><span>\uD83D\uDCE4 ' + esc(State.exportOutputFn || 'Export') + '</span>';
+          html += '<div style="display:flex;gap:4px">';
+          html += '<button class="lbtn" id="rrmt-exp-copy">Copy All</button>';
+          html += '<button class="lbtn" id="rrmt-exp-clr">\u2715 Clear</button>';
+          html += '</div></div>';
+          html += '<div class="dg-hint">Tap Copy All, or select all text below and copy</div>';
+          html += '<textarea class="dg-ta" id="rrmt-exp-ta" readonly></textarea>';
+          html += '</div>';
+        }
+
+        html += '<button class="lbtn" id="rrmt-lb">Copy log (last 50)</button>';
+        html += '&nbsp;<button class="lbtn" id="rrmt-diag">Copy DOM diagnostics</button>';
+
+        /* diagnostic output area — only rendered when State.diagOutput is set */
+        if (State.diagOutput) {
+          html += '<div class="dg-wrap">';
+          html += '<div class="dg-hd"><span>\uD83D\uDD0D Diagnostics captured</span>';
+          html += '<button class="lbtn" id="rrmt-dgclr">\u2715 Clear</button></div>';
+          if (State.diagMsg) {
+            html += '<div class="dg-msg">' + esc(State.diagMsg) + '</div>';
+          }
+          html += '<div class="dg-hint">If copy failed: tap text area below \u2192 triple-tap \u2192 select all \u2192 copy</div>';
+          html += '<textarea class="dg-ta" id="rrmt-dgta" readonly></textarea>';
+          html += '</div>';
+        }
+
+        html += '</div>'; /* /dh-body */
       }
+      html += '</div>'; /* /dh-wrap */
 
       var _savedScroll = $bd.scrollTop;
       $bd.innerHTML = html;
@@ -2570,12 +2622,18 @@
       });
       const scOnEl = shadow.getElementById('rrmt-sc-on');
       if (scOnEl) scOnEl.addEventListener('change', function () {
-        State.statusEnabled = this.checked; render();
+        State.statusEnabled = this.checked;
+        PersistenceStore.savePref(STATUS_PREF_KEY, this.checked);
+        render();
       });
       const scKeyEl = shadow.getElementById('rrmt-sc-key');
       if (scKeyEl) scKeyEl.addEventListener('change', function () {
         /* Store key in State — never log it */
         State.apiKey = this.value.trim();
+      });
+      const dhTglEl = shadow.getElementById('rrmt-dh-tgl');
+      if (dhTglEl) dhTglEl.addEventListener('click', function () {
+        State.diagHistOpen = !State.diagHistOpen; render();
       });
       const dwHistTgl = shadow.getElementById('rrmt-dw-hist-tgl');
       if (dwHistTgl) dwHistTgl.addEventListener('click', function () {
@@ -2595,6 +2653,7 @@
       function _doExport(text, fname, mime) {
         State.exportOutput   = text;
         State.exportOutputFn = fname;
+        State.diagHistOpen   = true; /* auto-expand to show export output */
         downloadText(fname, mime, text);  /* desktop bonus; silently ignored on iOS */
         render();
         $bd.scrollTop = $bd.scrollHeight; /* scroll to reveal export textarea */
@@ -2616,6 +2675,7 @@
         State.dwImportOpen    = !State.dwImportOpen;
         State.dwImportError   = '';
         State.dwImportSuccess = '';
+        if (State.dwImportOpen) State.diagHistOpen = true; /* auto-expand when opening import */
         render();
         if (State.dwImportOpen) $bd.scrollTop = $bd.scrollHeight; /* reveal import pane */
       });
@@ -2667,8 +2727,9 @@
       const diagEl = shadow.getElementById('rrmt-diag');
       if (diagEl) diagEl.addEventListener('click', () => {
         const txt = captureDomDiag();
-        State.diagOutput = txt;
-        State.diagMsg    = null;
+        State.diagOutput   = txt;
+        State.diagMsg      = null;
+        State.diagHistOpen = true; /* auto-expand to show diagnostics */
         render();
 
         /* attempt clipboard copy after render (button ref may be stale — look it up again) */
@@ -2799,6 +2860,9 @@
     PersistenceStore.load();
     var _dwPref = PersistenceStore.loadPref(DW_PREF_KEY, DEFAULT_DW_MIN_BET);
     if (typeof _dwPref === 'number' && _dwPref >= 0) State.dwWatchMin = _dwPref;
+    /* Respect explicitly saved OFF preference; null (never saved) keeps the default ON */
+    var _statusPref = PersistenceStore.loadPref(STATUS_PREF_KEY, null);
+    if (_statusPref === false) State.statusEnabled = false;
     UI.build();
     window.__RRMT__ = { version: VERSION, isAlive: UI.isAlive, destroy: UI.destroy, open: UI.open, close: UI.close };
     if (window.__RRMT_EXPOSE__ === true) {
@@ -2818,7 +2882,7 @@
         DisappearanceEngine, StatusChecker,
         PersistenceStore,
         DE_HISTORY_MAX, DE_STORE_VERSION,
-        DW_PREF_KEY, DEFAULT_DW_MIN_BET,
+        DW_PREF_KEY, DEFAULT_DW_MIN_BET, STATUS_PREF_KEY,
         exportHistoryJSON, exportHistoryCSV, importHistoryJSON,
       };
     }
