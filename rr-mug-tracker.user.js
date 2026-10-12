@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RR Mug Tracker
 // @namespace    fatboy.torn
-// @version      1.1.3
+// @version      1.1.4
 // @description  Russian Roulette lobby tracker with disappearance-watch intelligence for Torn PDA (iOS) and desktop.
 // @author       FATBOY [572123]
 // @match        https://www.torn.com/page.php*
@@ -422,7 +422,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.1.3';
+  const VERSION = '1.1.4';
   if (window.top !== window.self) return;
 
   /* isRRPage accepts optional (pn, qs) args for test-harness use */
@@ -468,6 +468,8 @@
   const DE_INFLIGHT_TIMEOUT_MS  = 15000;            /* force-clear stalled _inFlight guard */
   const DE_RETRY_DELAY_MS       = 400;              /* delay before single transient retry */
   const STATUS_PREF_KEY         = 'rrmt_status_pref'; /* saves user ON/OFF preference */
+  const LOBBY_FRESH_MS          = 5 * 60 * 1000;      /* lobby status freshness threshold */
+  const STATUS_STALE_MS         = 5 * 60 * 1000;      /* age at which Okay becomes Stale */
 
   /* Profile-link texts that are UI chrome, not player names */
   const UI_LABEL = /^(view\s+profile\.?|premium\s+data|follow|unfollow|report|trade|send\s+message|send\s+gift|bounty|add\s+to\s+friend)$/i;
@@ -495,6 +497,9 @@
     exportOutputFn:  '',       // filename hint for export display
     dwWatchMin:      DEFAULT_DW_MIN_BET,  // watch-panel display filter (0 = show all)
     dwHospOpen:      false,               // hospital/inactive subsection expanded
+    mbDraft:         null,    // unfinished Min Bet text; null = use fmtBet(State.minBet)
+    dwMbDraft:       null,    // unfinished Min Watch Bet text; null = use fmtBet(State.dwWatchMin)
+    lobbyStatus:     new Map(), // playerId → { status, ts, error } — lobby hospital checks
   };
 
   /* ============================ 3. PARSING ============================ */
@@ -2039,10 +2044,11 @@
    * or console output.
    */
   const StatusChecker = (function () {
-    let _inFlight      = false;
-    let _inFlightSince = 0;
-    let _lastAt        = 0;
-    let _currentToken  = null;  /* invalidated on force-clear; callbacks check identity */
+    let _inFlight        = false;
+    let _inFlightSince   = 0;
+    let _inFlightPlayerId = null;
+    let _lastAt          = 0;
+    let _currentToken    = null;  /* invalidated on force-clear; callbacks check identity */
 
     function _isClientError(err) {
       if (!err) return false;
@@ -2140,77 +2146,154 @@
         .catch(function (e) { if (e) { clearTimeout(tid); cb(null, 'Fetch error'); } });
     }
 
+    function _getLobbyDue(now) {
+      var _lobbyMin = State.minBet;
+      /* Evict entries for players no longer in the lobby */
+      var currentIds = new Set();
+      State.games.forEach(function(g) { if (g.playerId) currentIds.add(g.playerId); });
+      State.lobbyStatus.forEach(function(_, pid) {
+        if (!currentIds.has(pid)) State.lobbyStatus.delete(pid);
+      });
+      /* Cap cache to prevent unbounded growth in very long sessions */
+      if (State.lobbyStatus.size > 200) {
+        var byAge = Array.from(State.lobbyStatus.entries())
+          .sort(function(a, b) { return a[1].ts - b[1].ts; });
+        for (var ci = 0; ci < byAge.length - 200; ci++) {
+          State.lobbyStatus.delete(byAge[ci][0]);
+        }
+      }
+      /* Collect eligible {playerId, bet} pairs */
+      var pairs = [];
+      State.games.forEach(function(g) {
+        if (!g.playerId || !/^\d+$/.test(g.playerId)) return;
+        if (!State.tracking) return;
+        if (g.bet == null) return;                                      /* exclude unknown-bet games */
+        if (_lobbyMin > 0 && g.bet < _lobbyMin) return;                /* below min bet */
+        var prev = State.lobbyStatus.get(g.playerId);
+        if (prev && (now - prev.ts) < LOBBY_FRESH_MS) return;          /* fresh — skip */
+        pairs.push({ playerId: g.playerId, bet: g.bet });
+      });
+      /* Higher-value games checked first */
+      pairs.sort(function(a, b) { return b.bet - a.bet; });
+      return pairs.map(function(p) { return p.playerId; });
+    }
+
     function tick(now) {
       if (!State.statusEnabled) return;
       /* Force-clear a stalled in-flight guard (e.g. PDA promise never resolved) */
       if (_inFlight && (now - _inFlightSince) > DE_INFLIGHT_TIMEOUT_MS) {
-        _currentToken = null;          /* reject any in-flight callback from timed-out request */
-        _inFlight = false; _inFlightSince = 0;
+        _currentToken     = null;
+        _inFlight         = false;
+        _inFlightSince    = 0;
+        _inFlightPlayerId = null;
       }
       if (_inFlight) return;
       var key = _effectiveKey();
       if (!key) return;
       if (now - _lastAt < DE_RATE_MS) return;
 
+      /* DW checks take priority; lobby checks fill idle capacity */
       var due = DisappearanceEngine.getDueChecks(now);
-      if (!due.length) return;
+      var isLobbyCheck  = false;
+      var lobbyPlayerId = null;
 
-      var item = due[0];
-      /* Stale-response guard: verify game is still trackable */
-      var stillTracked = (function () {
-        var cands = DisappearanceEngine.getCandidates();
-        for (var si = 0; si < cands.length; si++) {
-          if (cands[si].gameId === item.gameId) return true;
-        }
-        return false;
-      }());
-      if (!stillTracked) return;
+      if (due.length) {
+        var item = due[0];
+        /* Stale-response guard: verify game is still trackable */
+        var stillTracked = (function () {
+          var cands = DisappearanceEngine.getCandidates();
+          for (var si = 0; si < cands.length; si++) {
+            if (cands[si].gameId === item.gameId) return true;
+          }
+          return false;
+        }());
+        if (!stillTracked) return;
 
-      var myToken    = (_currentToken = {});  /* fresh token — stale callbacks will not match */
-      _inFlight      = true;
-      _inFlightSince = now;
-      _lastAt        = now;
+        var myToken       = (_currentToken = {});
+        _inFlight         = true;
+        _inFlightSince    = now;
+        _inFlightPlayerId = item.playerId;
+        _lastAt           = now;
 
-      _doFetchWithRetry(item.playerId, key, function (status, err, apiTs, description, details, until) {
-        if (_currentToken !== myToken) return;  /* timed-out or superseded request — discard */
-        _currentToken  = null;
-        _inFlight      = false;
-        _inFlightSince = 0;
-        var ts = Date.now();
-        if (status) {
-          item.slot.result = status;
-          item.slot.ts     = ts;
-          item.slot.apiTs  = apiTs || null;
-          DisappearanceEngine._updateStatusResult(item.gameId, status, ts, apiTs, description, details, until);
-        } else {
-          /* Mark slot errored so it is not re-queued */
-          item.slot.result = 'ERROR';
-          item.slot.error  = err || 'Unknown';
-          item.slot.ts     = ts;
-        }
-        DisappearanceEngine.tick(ts);
-        UI.render();
-      });
+        _doFetchWithRetry(item.playerId, key, function (status, err, apiTs, description, details, until) {
+          if (_currentToken !== myToken) return;
+          _currentToken     = null;
+          _inFlight         = false;
+          _inFlightSince    = 0;
+          _inFlightPlayerId = null;
+          var ts = Date.now();
+          if (status) {
+            item.slot.result = status;
+            item.slot.ts     = ts;
+            item.slot.apiTs  = apiTs || null;
+            DisappearanceEngine._updateStatusResult(item.gameId, status, ts, apiTs, description, details, until);
+            /* Share result — prevents a redundant lobby check for the same player */
+            State.lobbyStatus.set(item.playerId, { status: status, ts: ts, error: null });
+            /* Cap size — _getLobbyDue() normally prunes, but DW checks may run without it */
+            if (State.lobbyStatus.size > 200) {
+              var _lsByAge = Array.from(State.lobbyStatus.entries())
+                .sort(function(a, b) { return a[1].ts - b[1].ts; });
+              for (var _lci = 0; _lci < _lsByAge.length - 200; _lci++) {
+                State.lobbyStatus.delete(_lsByAge[_lci][0]);
+              }
+            }
+          } else {
+            item.slot.result = 'ERROR';
+            item.slot.error  = err || 'Unknown';
+            item.slot.ts     = ts;
+          }
+          DisappearanceEngine.tick(ts);
+          UI.render();
+        });
+      } else {
+        /* Opportunistic lobby hospital check */
+        var lobbyDue = _getLobbyDue(now);
+        if (!lobbyDue.length) return;
+        lobbyPlayerId = lobbyDue[0];
+
+        var myToken2      = (_currentToken = {});
+        _inFlight         = true;
+        _inFlightSince    = now;
+        _inFlightPlayerId = lobbyPlayerId;
+        _lastAt           = now;
+
+        _doFetchWithRetry(lobbyPlayerId, key, function (status, err, apiTs) {
+          if (_currentToken !== myToken2) return;
+          _currentToken     = null;
+          _inFlight         = false;
+          _inFlightSince    = 0;
+          _inFlightPlayerId = null;
+          var ts = Date.now();
+          State.lobbyStatus.set(lobbyPlayerId, { status: status || null, ts: ts, error: err || null });
+          UI.render();
+        });
+      }
     }
 
     function canCheck() { return State.statusEnabled && !!_effectiveKey(); }
+    function checkingPlayerId() { return _inFlightPlayerId; }
     function _parseRespTest(text, cb) { _parseResp(text, cb); } /* test-only */
 
     /* test-only helpers — not called by production code */
     function _testState() {
-      return { inFlight: _inFlight, inFlightSince: _inFlightSince, hasToken: _currentToken !== null };
+      return { inFlight: _inFlight, inFlightSince: _inFlightSince, hasToken: _currentToken !== null,
+               inFlightPlayerId: _inFlightPlayerId };
     }
-    function _testSetFlight(v, since) {
+    function _testSetFlight(v, since, playerId) {
       _inFlight = v; _inFlightSince = since || 0;
+      _inFlightPlayerId = (v && playerId) ? playerId : null;
       _currentToken = v ? {} : null;
     }
     function _testForceExpireClear(now) {
-      /* Simulates the force-clear path without requiring real elapsed time */
-      _currentToken = null;
-      _inFlight = false; _inFlightSince = 0;
+      _currentToken     = null;
+      _inFlight         = false;
+      _inFlightSince    = 0;
+      _inFlightPlayerId = null;
     }
 
-    return { tick, canCheck, _parseRespTest, _testState, _testSetFlight, _testForceExpireClear };
+    return { tick, canCheck, checkingPlayerId,
+             _parseRespTest, _testState, _testSetFlight, _testForceExpireClear,
+             _testGetLobbyDue: _getLobbyDue };
   })();
 
   /* ============================ 11. EXPORT / IMPORT HELPERS ============================ */
@@ -2287,7 +2370,7 @@
   /* ============================ 12. UI ============================ */
   const UI = (function () {
     let host = null, shadow = null, _open = false;
-    let $fab, $ov, $tgl, $cls, $bd;
+    let $fab, $ov, $tgl, $cls, $bd, $g, $w, $c;
 
     const CSS = [
       ':host{all:initial}*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}',
@@ -2309,8 +2392,14 @@
       '.gnm{font-weight:600;color:#c080f0;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1 1 0}',
       '.gid{font-size:10px;color:#9070b0;flex-shrink:0;font-weight:400;white-space:nowrap}',
       '.gx{font-size:11px;color:#9070b0;margin-top:2px}',
-      '.ga{font-size:11px;color:#8070a0;margin-top:1px}',
-      '.ge{font-size:10px;color:#8070a0;font-style:italic}',
+      '.ga{font-size:11px;color:#9080b0;margin-top:1px}',
+      '.ge{font-size:10px;color:#9080b0;font-style:italic}',
+      '.gs{font-size:10px;margin-top:2px;padding:1px 0}',
+      '.gs.ok{color:#5cb85c}',
+      '.gs.ho{color:#d09050}',
+      '.gs.stale{color:#8070a0}',
+      '.gs.chk{color:#7080c0;font-style:italic}',
+      '.gs.pnd{color:#5a4a7a}',
       '.gl{display:flex;gap:5px;margin-top:5px}',
       '.gl a{flex:1;padding:5px 2px;text-align:center;border-radius:5px;border:1px solid #3a1a5a;background:#0c0420;color:#9070b0;font-size:11px;font-weight:600;text-decoration:none;touch-action:manipulation;-webkit-tap-highlight-color:transparent;display:block;cursor:pointer}',
       '.gl a.dis{opacity:.35;pointer-events:none;cursor:default}',
@@ -2350,6 +2439,7 @@
       '.dw-cfg input[type=checkbox]{width:13px;height:13px;accent-color:#8040c0;cursor:pointer}',
       '.dw-cfg input[type=password]{max-width:130px;padding:3px 6px;border-radius:4px;border:1px solid #3a1a5a;background:#080410;color:#ddd0f0;font:10px inherit}',
       '.dw-cfg input[type=text]{width:60px;padding:3px 6px;border-radius:4px;border:1px solid #3a1a5a;background:#080410;color:#ddd0f0;font:10px inherit}',
+      '.inp-err{font-size:10px;color:#c05050;margin-left:2px}',
       '.dw-cnt{font-size:10px;color:#8060a0;padding:4px 0 2px}',
       '.dwnt{color:#7a5090;font-variant-numeric:tabular-nums}',
       '.dw-hist{margin-top:4px;padding-top:4px;border-top:1px solid #1e1030;font-size:10px;color:#5a4070}',
@@ -2360,10 +2450,11 @@
       '.dw-hist-oc.T{color:#6070a0}',
       '.dw-empty{font-size:11px;color:#6a4a7a;padding:8px 0;text-align:center}',
       /* hospital / inactive subsection */
-      '.dw-legend{font-size:9px;color:#6a4a7a;padding:2px 0 4px;letter-spacing:.01em}',
-      '.dw-legend span{color:#7a5a8a}',
-      '.dw-prinfo{font-size:9px;color:#5a406a;padding:1px 0 4px;font-style:italic}',
-      '.dw-hosp-noatk{font-size:9px;color:#7a5040;padding:3px 7px;border-radius:4px;border:1px solid #2a1a1a;background:#100808;white-space:nowrap}',
+      '.dw-legend{font-size:9px;color:#7a5a8a;padding:2px 0 4px;letter-spacing:.01em}',
+      '.dw-legend span{color:#9070aa}',
+      '.dw-prinfo{font-size:9px;color:#7a5a8a;padding:1px 0 4px;font-style:italic}',
+      '.dw-stale{color:#8070a0}',
+      '.dw-hosp-noatk{font-size:9px;color:#9a7050;padding:3px 7px;border-radius:4px;border:1px solid #2a1a1a;background:#100808;white-space:nowrap}',
       '.dw-hosp-wrap{margin-top:5px;padding-top:4px;border-top:1px solid #1e1030}',
       '.dw-hosp-tgl{display:flex;width:100%;align-items:center;justify-content:space-between;padding:4px 7px;border-radius:5px;border:1px solid #2a1a3a;background:#0a0418;color:#6a4a6a;font-size:10px;font-weight:600;cursor:pointer;touch-action:manipulation}',
       '.dw-hosp-badge{font-size:9px;background:#1a1a3a;border-radius:8px;padding:1px 5px;color:#6a6090;margin-left:2px}',
@@ -2396,89 +2487,116 @@
       return '$' + n.toLocaleString();
     }
 
+    function _inputFocused(container) {
+      var ae = shadow && shadow.activeElement;
+      return !!(ae && container && container.contains(ae) &&
+                (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.tagName === 'SELECT'));
+    }
+
     function render() {
-      if (!host || !host.isConnected || !$bd) return;
-      const now = Date.now();
-      const games = Array.from(State.games.values());
-      /* v1.1.2: Min Bet = lobby display only; Min Watch Bet = DW/engine only */
+      if (!host || !host.isConnected || !$bd || !$g || !$w || !$c) return;
+      var now = Date.now();
+      var games = Array.from(State.games.values());
       var _lobbyMin = State.minBet;
       var _dwMin    = State.dwWatchMin;
-      games.sort((a, b) => {
+      games.sort(function(a, b) {
         if (a.bet == null && b.bet != null) return 1;
         if (a.bet != null && b.bet == null) return -1;
         if (a.bet !== b.bet) return (b.bet || 0) - (a.bet || 0);
         return (a.firstSeen || 0) - (b.firstSeen || 0);
       });
       var dispGames = _lobbyMin > 0 ? games.filter(function(g) { return g.bet == null || g.bet >= _lobbyMin; }) : games;
-      let html = '';
-
       var _filteredCnt = games.length - dispGames.length;
-      html += '<div class="bar"><span class="dot ' + (State.tracking ? 'on' : 'off') + '"></span>';
-      html += '<strong style="color:#c080f0">' + dispGames.length + '</strong>&nbsp;eligible';
-      if (_filteredCnt > 0) html += '&nbsp;&middot;&nbsp;' + _filteredCnt + '&nbsp;filtered';
-      html += '</div>';
 
+      /* === Section G: lobby games (always updated — no inputs) === */
+      var htmlG = '';
+      htmlG += '<div class="bar"><span class="dot ' + (State.tracking ? 'on' : 'off') + '"></span>';
+      htmlG += '<strong style="color:#c080f0">' + dispGames.length + '</strong>&nbsp;eligible';
+      if (_filteredCnt > 0) htmlG += '&nbsp;&middot;&nbsp;' + _filteredCnt + '&nbsp;filtered';
+      htmlG += '</div>';
       if (State.parseOk === false) {
-        html += '<div class="warn">\u26A0\uFE0F ' + esc(State.parseNote || 'Could not parse RR lobby') + '</div>';
+        htmlG += '<div class="warn">\u26A0\uFE0F ' + esc(State.parseNote || 'Could not parse RR lobby') + '</div>';
       }
-
       if (!games.length) {
-        html += '<div class="empty">' + (State.tracking ? 'Watching for games\u2026' : 'Paused. Tap \u25B6 to start.') + '</div>';
+        htmlG += '<div class="empty">' + (State.tracking ? 'Watching for games\u2026' : 'Paused. Tap \u25B6 to start.') + '</div>';
       } else if (!dispGames.length) {
-        html += '<div class="empty">All observed games are below your minimum bet.</div>';
+        htmlG += '<div class="empty">All observed games are below your minimum bet.</div>';
       } else {
-        for (const g of dispGames) {
-          const hi       = g.bet != null && g.bet >= _lobbyMin;
-          const profURL  = tornProfileURL(g.playerId);
-          const atkURL   = tornAttackURL(g.playerId);
-          html += '<div class="gm' + (hi ? ' hi' : '') + '">';
-          /* Name row: player name (truncatable) + numeric player ID */
-          html += '<div class="gn"><span class="gnm">' + esc(g.playerName) + '</span>';
-          if (g.playerId) html += '<span class="gid">#' + esc(g.playerId) + '</span>';
-          html += '</div>';
-          /* Bet row */
-          html += '<div class="gx">Bet:&nbsp;<span' + (hi ? ' class="ok"' : '') + '>' + esc(fmtBet(g.bet)) + '</span>';
-          if (g.playerCount != null) html += '&nbsp;&middot;&nbsp;Players:&nbsp;' + g.playerCount;
-          if (g.gameId) html += '&nbsp;&middot;&nbsp;<span style="color:#8060a0;font-size:10px">Game:' + esc(g.gameId) + '</span>';
-          html += '</div>';
-          /* Age + countdown — single note when age unknown to avoid duplicate "Age unknown" */
+        for (var gi = 0; gi < dispGames.length; gi++) {
+          var g        = dispGames[gi];
+          var hi       = g.bet != null && g.bet >= _lobbyMin;
+          var profURL  = tornProfileURL(g.playerId);
+          var atkURL   = tornAttackURL(g.playerId);
+          htmlG += '<div class="gm' + (hi ? ' hi' : '') + '">';
+          htmlG += '<div class="gn"><span class="gnm">' + esc(g.playerName) + '</span>';
+          if (g.playerId) htmlG += '<span class="gid">#' + esc(g.playerId) + '</span>';
+          htmlG += '</div>';
+          htmlG += '<div class="gx">Bet:&nbsp;<span' + (hi ? ' class="ok"' : '') + '>' + esc(fmtBet(g.bet)) + '</span>';
+          if (g.playerCount != null) htmlG += '&nbsp;&middot;&nbsp;Players:&nbsp;' + g.playerCount;
+          if (g.gameId) htmlG += '&nbsp;&middot;&nbsp;<span style="color:#8060a0;font-size:10px">Game:' + esc(g.gameId) + '</span>';
+          htmlG += '</div>';
           if (g.firstSeen == null) {
-            html += '<div class="ga">Game age unknown \u2014 timer unavailable</div>';
-            html += '<div class="ge" id="rrmt-tm-' + esc(g.gameKey) + '" style="display:none"></div>';
+            htmlG += '<div class="ga">Game age unknown \u2014 timer unavailable</div>';
+            htmlG += '<div class="ge" id="rrmt-tm-' + esc(g.gameKey) + '" style="display:none"></div>';
           } else {
-            html += '<div class="ga">Observed: ' + esc(formatAge(g.firstSeen, now)) + '</div>';
-            html += '<div class="ge" id="rrmt-tm-' + esc(g.gameKey) + '">Est. remaining (\u224815 min, not guaranteed): ' + esc(formatCountdown(g.firstSeen, now)) + '</div>';
+            htmlG += '<div class="ga">Observed: ' + esc(formatAge(g.firstSeen, now)) + '</div>';
+            htmlG += '<div class="ge" id="rrmt-tm-' + esc(g.gameKey) + '">Est. remaining (\u224815 min, not guaranteed): ' + esc(formatCountdown(g.firstSeen, now)) + '</div>';
           }
-          /* Profile / Attack tap links — disabled if playerId is invalid */
-          html += '<div class="gl">';
-          html += '<a' + (profURL ? ' href="' + esc(profURL) + '"' : '') + ' target="_blank" rel="noopener noreferrer" aria-label="Profile" title="View profile" class="prf' + (profURL ? '' : ' dis') + '">\uD83D\uDC64</a>';
-          html += '<a' + (atkURL  ? ' href="' + esc(atkURL)  + '"' : '') + ' target="_blank" rel="noopener noreferrer" aria-label="Attack" title="Attack player" class="atk' + (atkURL  ? '' : ' dis') + '">\u2694\uFE0F</a>';
-          html += '</div>';
-          html += '</div>';
+          /* Lobby hospital status from proactive checks.
+             Cached results are always rendered (Hospital protection must not depend on
+             whether new requests are currently permitted). "Checking" / "Check pending"
+             labels are only shown when canCheck() is true. */
+          var lbHosp = false;
+          if (g.playerId) {
+            var lsEntry = State.lobbyStatus.get(g.playerId);
+            if (lsEntry && lsEntry.status) {
+              var lsAge    = now - lsEntry.ts;
+              var lsAgeStr = esc(formatAge(lsEntry.ts, now)) + '&nbsp;ago';
+              if (lsEntry.status === 'Hospital') {
+                lbHosp = true;
+                htmlG += '<div class="gs ho">\uD83C\uDFE5 Hospital (' + lsAgeStr + ')</div>';
+              } else if (lsAge > STATUS_STALE_MS) {
+                htmlG += '<div class="gs stale">Stale \u2014 last: ' + esc(lsEntry.status) + ' (' + lsAgeStr + ')</div>';
+              } else {
+                htmlG += '<div class="gs ok">Okay (' + lsAgeStr + ')</div>';
+              }
+            } else if (StatusChecker.canCheck()) {
+              if (StatusChecker.checkingPlayerId() === g.playerId) {
+                htmlG += '<div class="gs chk">Checking\u2026</div>';
+              } else {
+                htmlG += '<div class="gs pnd">Check\u00a0pending</div>';
+              }
+            }
+          }
+          htmlG += '<div class="gl">';
+          htmlG += '<a' + (profURL ? ' href="' + esc(profURL) + '"' : '') + ' target="_blank" rel="noopener noreferrer" aria-label="Profile" title="View profile" class="prf' + (profURL ? '' : ' dis') + '">\uD83D\uDC64</a>';
+          htmlG += '<a' + (atkURL && !lbHosp ? ' href="' + esc(atkURL) + '"' : '') + ' target="_blank" rel="noopener noreferrer" aria-label="Attack" title="' + (lbHosp ? 'Player is in hospital' : 'Attack player') + '" class="atk' + (atkURL && !lbHosp ? '' : ' dis') + '">\u2694\uFE0F</a>';
+          htmlG += '</div>';
+          htmlG += '</div>';
         }
       }
+      $g.innerHTML = htmlG;
 
-      /* ── Disappearance Watch ── */
+      /* === Section W: Disappearance Watch (skipped if #rrmt-dw-mb or #rrmt-sc-key focused) === */
       var dwCands    = DisappearanceEngine.getCandidates();
       var dwHist     = DisappearanceEngine.getHistory();
-      /* v1.1.2: DW display uses dwWatchMin only */
       var dwFiltered = _dwMin > 0
-        ? dwCands.filter(function (c) { return c.bet == null || c.bet >= _dwMin; })
+        ? dwCands.filter(function(c) { return c.bet == null || c.bet >= _dwMin; })
         : dwCands;
-      var dwActive = dwFiltered.filter(function (c) { return c.state !== 'HOSPITAL'; });
-      var dwHosp   = dwFiltered.filter(function (c) { return c.state === 'HOSPITAL'; });
+      var dwActive = dwFiltered.filter(function(c) { return c.state !== 'HOSPITAL'; });
+      var dwHosp   = dwFiltered.filter(function(c) { return c.state === 'HOSPITAL'; });
 
-      html += '<div class="dws">';
-      html += '<div class="dwsh">\uD83D\uDC41 Disappearance Watch';
-      if (dwActive.length) html += '<span class="dwsc">' + dwActive.length + '</span>';
-      if (dwHosp.length)   html += '<span class="dw-hosp-badge">' + dwHosp.length + '\u00a0hosp</span>';
-      html += '</div>';
+      var htmlW = '';
+      htmlW += '<div class="dws">';
+      htmlW += '<div class="dwsh">\uD83D\uDC41 Disappearance Watch';
+      if (dwActive.length) htmlW += '<span class="dwsc">' + dwActive.length + '</span>';
+      if (dwHosp.length)   htmlW += '<span class="dw-hosp-badge">' + dwHosp.length + '\u00a0hosp</span>';
+      htmlW += '</div>';
 
       function _renderDwCard(dc, isHospCard) {
-        var isAct = !isHospCard && dc.priority >= 60;
+        var isAct   = !isHospCard && dc.priority >= 60;
         var cardCls = isHospCard ? ' sup' : (isAct ? ' act' : '');
-        var s = '<div class="dwc' + cardCls + '">';
-        /* Name + priority badge */
+        var s  = '<div class="dwc' + cardCls + '">';
         var isHosp = dc.state === 'HOSPITAL';
         s += '<div>';
         s += '<span class="dwp' + (isAct ? ' hi' : '') + '" title="Heuristic investigation priority (0\u2013100) \u2014 not a cash probability.">' + dc.priority + '</span>';
@@ -2486,18 +2604,13 @@
         s += '<span class="dwid">#' + esc(dc.playerId) + '</span>';
         if (isHospCard) s += '<span class="dw-hosp-lbl">In hospital</span>';
         s += '</div>';
-        /* Bet + game */
         s += '<div class="dwx">Bet:&nbsp;' + esc(fmtBet(dc.bet));
         if (dc.gameId) s += '&nbsp;&middot;&nbsp;Game:&nbsp;' + esc(dc.gameId);
         s += '</div>';
-        /* Time info — elapsed uses a live span updated by tickDwTimers each second */
-        var dwElapsed = dc.confirmedTs ? formatAge(dc.confirmedTs, now) : '?';
+        var dwElapsed     = dc.confirmedTs ? formatAge(dc.confirmedTs, now) : '?';
         var dwElapsedAttr = dc.confirmedTs ? ' data-rrmt-dw-elapsed="' + dc.confirmedTs + '"' : '';
-        var dwObsHtml = '';
-        if (dc.firstSeen != null) {
-          dwObsHtml = '&nbsp;&middot;&nbsp;Observed:&nbsp;' + esc(formatAge(dc.firstSeen, now));
-        }
-        /* Next scheduled check */
+        var dwObsHtml = dc.firstSeen != null
+          ? '&nbsp;&middot;&nbsp;Observed:&nbsp;' + esc(formatAge(dc.firstSeen, now)) : '';
         var dwNextTs = null;
         for (var nci = 0; nci < dc.statusChecks.length; nci++) {
           var ncs = dc.statusChecks[nci];
@@ -2507,33 +2620,37 @@
         }
         var dwNextHtml = '';
         if (dwNextTs !== null && State.statusEnabled && StatusChecker.canCheck()) {
-          var dwNextAttr = ' data-rrmt-dw-next="' + dwNextTs + '"';
-          dwNextHtml = '&nbsp;&middot;&nbsp;Next:&nbsp;<span class="dwnt"' + dwNextAttr + '>' +
+          dwNextHtml = '&nbsp;&middot;&nbsp;Next:&nbsp;<span class="dwnt" data-rrmt-dw-next="' + dwNextTs + '">' +
                        esc(formatCountdownTo(dwNextTs, now)) + '</span>';
         }
         s += '<div class="dwx">Gone\u00a0for:&nbsp;<span' + dwElapsedAttr + '>' + esc(dwElapsed) +
              '</span>' + dwObsHtml + dwNextHtml + '</div>';
-        /* Status */
+        /* Status with freshness labels */
         var dwStCls = dc.latestStatus === 'Okay' ? 'ok' : dc.latestStatus === 'Hospital' ? 'ho' : '';
         s += '<div class="dwst ' + dwStCls + '">';
         if (!State.statusEnabled) {
           s += 'Status: checks disabled';
         } else if (dc.latestStatus) {
-          var dwStAge = dc.latestStatusTs ? ('&nbsp;(' + esc(formatAge(dc.latestStatusTs, now)) + ' ago)') : '';
-          var dwStatusLabel = (dc.latestStatus === 'Hospital' && dc.hospitalLabel)
-            ? dc.hospitalLabel : dc.latestStatus;
-          s += 'Status:&nbsp;<strong>' + esc(dwStatusLabel) + '</strong>' + dwStAge;
+          var stAge    = now - (dc.latestStatusTs || 0);
+          var stAgeStr = dc.latestStatusTs ? ('&nbsp;(' + esc(formatAge(dc.latestStatusTs, now)) + '&nbsp;ago)') : '';
+          var isStale  = stAge > STATUS_STALE_MS && dc.latestStatus !== 'Hospital';
+          var dwStatusLabel = (dc.latestStatus === 'Hospital' && dc.hospitalLabel) ? dc.hospitalLabel : dc.latestStatus;
+          if (isStale) {
+            s += 'Status:&nbsp;<strong class="dw-stale">Stale</strong>&nbsp;\u2014 last:&nbsp;' + esc(dwStatusLabel) + stAgeStr;
+          } else {
+            s += 'Status:&nbsp;<strong>' + esc(dwStatusLabel) + '</strong>' + stAgeStr;
+          }
+        } else if (StatusChecker.checkingPlayerId() === dc.playerId) {
+          s += 'Status:&nbsp;<em>Checking\u2026</em>';
         } else if (StatusChecker.canCheck()) {
-          s += 'Status: pending';
+          s += 'Status: Check pending';
         } else {
           s += 'Status: no API key';
         }
         s += '</div>';
-        /* Priority reason */
         if (dc.priorityReason) {
           s += '<div class="dwrsn">' + esc(dc.priorityReason) + '</div>';
         }
-        /* Action row */
         var dwProfURL = tornProfileURL(dc.playerId);
         var dwAtkURL  = tornAttackURL(dc.playerId);
         s += '<div class="dwbr">';
@@ -2541,7 +2658,6 @@
              ' target="_blank" rel="noopener noreferrer"' +
              ' aria-label="Profile" title="View profile"' +
              ' class="prf ico' + (dwProfURL ? '' : ' dis') + '">\uD83D\uDC64</a>';
-        /* Attack link disabled while known status is Hospital */
         if (isHosp) {
           s += '<span class="dw-hosp-noatk" title="Player is in hospital \u2014 not actionable">\uD83C\uDFE5\u00a0Not\u00a0actionable</span>';
         } else {
@@ -2559,84 +2675,88 @@
                '" data-dw-label="' + oLabel + '" title="' + oLabel + '">' + oShort + '</button>';
         }
         s += '</div>';
-        s += '</div>'; /* /dwc */
+        s += '</div>';
         return s;
       }
 
       if (!dwCands.length) {
-        /* Distinguish "never recorded" from "all moved to history" */
         if (dwHist.length > 0) {
-          html += '<div class="dw-empty">No active watches\u00a0\u2014 ' + dwHist.length + '\u00a0in history below.</div>';
+          htmlW += '<div class="dw-empty">No active watches\u00a0\u2014 ' + dwHist.length + '\u00a0in history below.</div>';
         } else {
-          html += '<div class="dw-empty">No disappearances recorded yet.</div>';
+          htmlW += '<div class="dw-empty">No disappearances recorded yet.</div>';
         }
       } else if (!dwFiltered.length) {
-        html += '<div class="dw-cnt">0 watched&nbsp;&middot;&nbsp;' + dwCands.length + ' total disappeared</div>';
-        html += '<div class="dw-empty">No disappeared games above your min watch bet.</div>';
+        htmlW += '<div class="dw-cnt">0 watched&nbsp;&middot;&nbsp;' + dwCands.length + ' total disappeared</div>';
+        htmlW += '<div class="dw-empty">No disappeared games above your min watch bet.</div>';
       } else {
         if (dwFiltered.length < dwCands.length) {
-          html += '<div class="dw-cnt">' + dwFiltered.length + ' watched&nbsp;&middot;&nbsp;' + dwCands.length + ' total disappeared</div>';
+          htmlW += '<div class="dw-cnt">' + dwFiltered.length + ' watched&nbsp;&middot;&nbsp;' + dwCands.length + ' total disappeared</div>';
         }
-        /* Compact outcome legend — visible on touch devices that have no hover */
-        html += '<div class="dw-legend">Outcomes:&nbsp;<span>W\u202FWon</span>&nbsp;\u00b7&nbsp;<span>L\u202FLost</span>&nbsp;\u00b7&nbsp;<span>T\u202FTimeout</span>&nbsp;\u00b7&nbsp;<span>?\u202FUnknown</span></div>';
-        /* Priority heuristic note — visible text, not just a tooltip */
-        html += '<div class="dw-prinfo">Priority\u202F=\u202Fheuristic\u202Frank\u00a0(0\u2013100)\u00a0\u2014\u00a0not\u00a0a\u00a0cash\u00a0probability</div>';
-        /* Active (non-hospital) candidates */
+        htmlW += '<div class="dw-legend">Outcomes:&nbsp;<span>W\u202FWon</span>&nbsp;\u00b7&nbsp;<span>L\u202FLost</span>&nbsp;\u00b7&nbsp;<span>T\u202FTimeout</span>&nbsp;\u00b7&nbsp;<span>?\u202FUnknown</span></div>';
+        htmlW += '<div class="dw-prinfo">Priority\u202F=\u202Fheuristic\u202Frank\u00a0(0\u2013100)\u00a0\u2014\u00a0not\u00a0a\u00a0cash\u00a0probability</div>';
         if (!dwActive.length) {
-          html += '<div class="dw-empty">All tracked players are currently in hospital.</div>';
+          htmlW += '<div class="dw-empty">All watched disappearances are currently hospitalised.</div>';
         } else {
           for (var di = 0; di < dwActive.length; di++) {
-            html += _renderDwCard(dwActive[di], false);
+            htmlW += _renderDwCard(dwActive[di], false);
           }
         }
-        /* Hospital / Inactive collapsed subsection */
         if (dwHosp.length) {
-          html += '<div class="dw-hosp-wrap">';
-          html += '<button class="dw-hosp-tgl" id="rrmt-dw-hosp-tgl">\uD83C\uDFE5\u00a0Hospital\u00a0/\u00a0Inactive\u00a0(' +
+          htmlW += '<div class="dw-hosp-wrap">';
+          htmlW += '<button class="dw-hosp-tgl" id="rrmt-dw-hosp-tgl">\uD83C\uDFE5\u00a0Hospital\u00a0/\u00a0Inactive\u00a0(' +
                   dwHosp.length + ')&nbsp;' + (State.dwHospOpen ? '\u25B2' : '\u25BC') + '</button>';
           if (State.dwHospOpen) {
-            html += '<div class="dw-hosp-body">';
+            htmlW += '<div class="dw-hosp-body">';
             for (var hj = 0; hj < dwHosp.length; hj++) {
-              html += _renderDwCard(dwHosp[hj], true);
+              htmlW += _renderDwCard(dwHosp[hj], true);
             }
-            html += '</div>';
+            htmlW += '</div>';
           }
-          html += '</div>';
+          htmlW += '</div>';
         }
       }
+      htmlW += '</div>';  /* /dws — DW cards section; no inputs, always safe to replace */
 
-      /* Status check config + Min Watch Bet */
-      html += '<div class="dw-cfg">';
-      html += '<label><input type="checkbox" id="rrmt-sc-on"' +
-              (State.statusEnabled ? ' checked' : '') + '>&nbsp;Status checks</label>';
+      if (!_inputFocused($w)) {
+        $w.innerHTML = htmlW;
+        _wireDw();
+      }
+
+      /* === Section C: dw-cfg + cfg + History & Diagnostics (skipped if any input focused) === */
       var pdaKeyLive = DE_PDA_KEY.indexOf('#') === -1;
+      var htmlC = '';
+      /* dw-cfg moved here so typing Min Watch does not freeze DW card updates in $w */
+      htmlC += '<div class="dw-cfg">';
+      htmlC += '<label><input type="checkbox" id="rrmt-sc-on"' +
+              (State.statusEnabled ? ' checked' : '') + '>&nbsp;Status checks</label>';
       if (State.statusEnabled && !pdaKeyLive) {
-        html += '<input type="password" id="rrmt-sc-key" placeholder="API key" value=""' +
+        htmlC += '<input type="password" id="rrmt-sc-key" placeholder="API key" value=""' +
                 ' title="Enter your Torn API key (read-only)">';
       } else if (State.statusEnabled && pdaKeyLive) {
-        html += '<span style="color:#5cb85c;font-size:9px">\u2713 PDA key active</span>';
+        htmlC += '<span style="color:#5cb85c;font-size:9px">\u2713 PDA key active</span>';
       }
-      html += '<label style="margin-left:6px;flex-shrink:0" title="Games below this amount are not tracked for disappearance">Min Watch:&nbsp;' +
+      htmlC += '<label style="margin-left:6px;flex-shrink:0" title="Games below this amount are not tracked for disappearance">Min Watch:&nbsp;' +
               '<input id="rrmt-dw-mb" type="text" size="6" value="' +
-              esc(fmtBet(State.dwWatchMin)) + '" placeholder="e.g.\u202F50M">' +
-              '</label>';
-      html += '</div>';
+              esc(State.dwMbDraft !== null ? State.dwMbDraft : fmtBet(State.dwWatchMin)) +
+              '" placeholder="e.g.\u202F50M"></label>';
+      if (State.dwMbDraft !== null && parseMinBet(State.dwMbDraft) === null) {
+        htmlC += '<span class="inp-err">Invalid</span>';
+      }
+      htmlC += '</div>';
+      htmlC += '<div class="cfg"><label title="Hides games below this amount from the main list">Min Bet (lobby):&nbsp;<input id="rrmt-mb" type="text" value="' + esc(State.mbDraft !== null ? State.mbDraft : fmtBet(State.minBet)) + '" placeholder="e.g. 200M"></label>';
+      if (State.mbDraft !== null && parseMinBet(State.mbDraft) === null) {
+        htmlC += '<span class="inp-err">Invalid</span>';
+      }
+      htmlC += '</div>';
 
-      html += '</div>'; /* /dws */
-
-      html += '<div class="cfg"><label title="Hides games below this amount from the main list">Min Bet (lobby):&nbsp;<input id="rrmt-mb" type="text" value="' + esc(fmtBet(State.minBet)) + '" placeholder="e.g. 200M"></label></div>';
-
-      /* History & Diagnostics — collapsible, collapsed by default */
-      html += '<div class="dh-wrap">';
-      html += '<button class="dh-tgl" id="rrmt-dh-tgl">History &amp; Diagnostics&nbsp;' +
+      htmlC += '<div class="dh-wrap">';
+      htmlC += '<button class="dh-tgl" id="rrmt-dh-tgl">History &amp; Diagnostics&nbsp;' +
               (State.diagHistOpen ? '\u25B2' : '\u25BC') + '</button>';
       if (State.diagHistOpen) {
-        html += '<div class="dh-body">';
-
-        /* History — paginated, accurate count */
-        html += '<div class="dw-hist">';
-        html += '<strong>' + dwHist.length + ' in history</strong>';
-        html += '&nbsp;<button class="lbtn" id="rrmt-dw-hist-tgl">' +
+        htmlC += '<div class="dh-body">';
+        htmlC += '<div class="dw-hist">';
+        htmlC += '<strong>' + dwHist.length + ' in history</strong>';
+        htmlC += '&nbsp;<button class="lbtn" id="rrmt-dw-hist-tgl">' +
                 (State.dwHistOpen ? '\u25B2 Hide' : '\u25BC History') + '</button>';
         if (State.dwHistOpen && dwHist.length > 0) {
           var pageSize  = DE_HIST_PAGE_SIZE;
@@ -2644,286 +2764,289 @@
           var page      = Math.min(Math.max(0, State.dwHistPage), pageCount - 1);
           var hStart    = page * pageSize;
           var showH     = dwHist.slice(hStart, hStart + pageSize);
-          for (var hi = 0; hi < showH.length; hi++) {
-            var hc = showH[hi];
+          for (var hi2 = 0; hi2 < showH.length; hi2++) {
+            var hc    = showH[hi2];
             var ocCls = hc.outcome === 'Won' ? '' : hc.outcome === 'Lost' ? ' L' : ' T';
-            html += '<div class="dw-hist-item">';
-            html += '<span class="dw-hist-nm">' + esc(hc.playerName || '') + ' (' + esc(hc.gameId) + ')</span>';
-            html += '<span>' + esc(hc.state) + '</span>';
-            if (hc.outcome) html += '<span class="dw-hist-oc' + ocCls + '">' + esc(hc.outcome) + '</span>';
-            html += '</div>';
+            htmlC += '<div class="dw-hist-item">';
+            htmlC += '<span class="dw-hist-nm">' + esc(hc.playerName || '') + ' (' + esc(hc.gameId) + ')</span>';
+            htmlC += '<span>' + esc(hc.state) + '</span>';
+            if (hc.outcome) htmlC += '<span class="dw-hist-oc' + ocCls + '">' + esc(hc.outcome) + '</span>';
+            htmlC += '</div>';
           }
           if (pageCount > 1) {
-            html += '<div style="display:flex;gap:4px;margin-top:3px;align-items:center;font-size:10px;color:#6a4a7a">';
-            html += '<button class="lbtn" id="rrmt-dw-hist-prev"' + (page === 0 ? ' disabled' : '') + '>&laquo;</button>';
-            html += '<span>' + (page + 1) + '\u202F/\u202F' + pageCount + '</span>';
-            html += '<button class="lbtn" id="rrmt-dw-hist-next"' + (page >= pageCount - 1 ? ' disabled' : '') + '>&raquo;</button>';
-            html += '</div>';
+            htmlC += '<div style="display:flex;gap:4px;margin-top:3px;align-items:center;font-size:10px;color:#6a4a7a">';
+            htmlC += '<button class="lbtn" id="rrmt-dw-hist-prev"' + (page === 0 ? ' disabled' : '') + '>&laquo;</button>';
+            htmlC += '<span>' + (page + 1) + '\u202F/\u202F' + pageCount + '</span>';
+            htmlC += '<button class="lbtn" id="rrmt-dw-hist-next"' + (page >= pageCount - 1 ? ' disabled' : '') + '>&raquo;</button>';
+            htmlC += '</div>';
           }
         }
-        html += '</div>';
-
-        /* Export / Import row */
-        html += '<div class="dw-exp-row">';
-        html += '<button class="lbtn" id="rrmt-dw-exp-json">Export JSON</button>';
-        html += '<button class="lbtn" id="rrmt-dw-exp-csv">Export CSV</button>';
-        html += '<button class="lbtn" id="rrmt-dw-imp-tgl">' + (State.dwImportOpen ? 'Cancel' : 'Import JSON') + '</button>';
+        htmlC += '</div>';
+        htmlC += '<div class="dw-exp-row">';
+        htmlC += '<button class="lbtn" id="rrmt-dw-exp-json">Export JSON</button>';
+        htmlC += '<button class="lbtn" id="rrmt-dw-exp-csv">Export CSV</button>';
+        htmlC += '<button class="lbtn" id="rrmt-dw-imp-tgl">' + (State.dwImportOpen ? 'Cancel' : 'Import JSON') + '</button>';
         if (PersistenceStore.isAvailable()) {
-          html += '<span style="font-size:9px;color:#5a8060;margin-left:2px">\u2713&nbsp;saved</span>';
+          htmlC += '<span style="font-size:9px;color:#5a8060;margin-left:2px">\u2713&nbsp;saved</span>';
         }
         if (State.dwImportSuccess) {
-          html += '<span style="font-size:9px;color:#5cb85c;margin-left:2px">' + esc(State.dwImportSuccess) + '</span>';
+          htmlC += '<span style="font-size:9px;color:#5cb85c;margin-left:2px">' + esc(State.dwImportSuccess) + '</span>';
         }
-        html += '</div>';
-
-        /* Import textarea — visible when dwImportOpen */
+        htmlC += '</div>';
         if (State.dwImportOpen) {
-          html += '<div class="dw-imp">';
+          htmlC += '<div class="dw-imp">';
           if (State.dwImportError) {
-            html += '<div class="dw-imp-err">' + esc(State.dwImportError) + '</div>';
+            htmlC += '<div class="dw-imp-err">' + esc(State.dwImportError) + '</div>';
           }
-          html += '<textarea id="rrmt-dw-imp-ta" placeholder="Paste exported JSON here\u2026"></textarea>';
-          html += '<div style="display:flex;gap:4px;margin-top:3px">';
-          html += '<button class="lbtn" id="rrmt-dw-imp-apply">Apply Import</button>';
-          html += '</div>';
-          html += '</div>';
+          htmlC += '<textarea id="rrmt-dw-imp-ta" placeholder="Paste exported JSON here\u2026"></textarea>';
+          htmlC += '<div style="display:flex;gap:4px;margin-top:3px">';
+          htmlC += '<button class="lbtn" id="rrmt-dw-imp-apply">Apply Import</button>';
+          htmlC += '</div>';
+          htmlC += '</div>';
         }
-
-        /* Export output — shown after export (mobile-safe: no download dependency) */
         if (State.exportOutput) {
-          html += '<div class="dg-wrap">';
-          html += '<div class="dg-hd"><span>\uD83D\uDCE4 ' + esc(State.exportOutputFn || 'Export') + '</span>';
-          html += '<div style="display:flex;gap:4px">';
-          html += '<button class="lbtn" id="rrmt-exp-copy">Copy All</button>';
-          html += '<button class="lbtn" id="rrmt-exp-clr">\u2715 Clear</button>';
-          html += '</div></div>';
-          html += '<div class="dg-hint">Tap Copy All, or select all text below and copy</div>';
-          html += '<textarea class="dg-ta" id="rrmt-exp-ta" readonly></textarea>';
-          html += '</div>';
+          htmlC += '<div class="dg-wrap">';
+          htmlC += '<div class="dg-hd"><span>\uD83D\uDCE4 ' + esc(State.exportOutputFn || 'Export') + '</span>';
+          htmlC += '<div style="display:flex;gap:4px">';
+          htmlC += '<button class="lbtn" id="rrmt-exp-copy">Copy All</button>';
+          htmlC += '<button class="lbtn" id="rrmt-exp-clr">\u2715 Clear</button>';
+          htmlC += '</div></div>';
+          htmlC += '<div class="dg-hint">Tap Copy All, or select all text below and copy</div>';
+          htmlC += '<textarea class="dg-ta" id="rrmt-exp-ta" readonly></textarea>';
+          htmlC += '</div>';
         }
-
-        html += '<button class="lbtn" id="rrmt-lb">Copy log (last 50)</button>';
-        html += '&nbsp;<button class="lbtn" id="rrmt-diag">Copy DOM diagnostics</button>';
-
-        /* diagnostic output area — only rendered when State.diagOutput is set */
+        htmlC += '<button class="lbtn" id="rrmt-lb">Copy log (last 50)</button>';
+        htmlC += '&nbsp;<button class="lbtn" id="rrmt-diag">Copy DOM diagnostics</button>';
         if (State.diagOutput) {
-          html += '<div class="dg-wrap">';
-          html += '<div class="dg-hd"><span>\uD83D\uDD0D Diagnostics captured</span>';
-          html += '<button class="lbtn" id="rrmt-dgclr">\u2715 Clear</button></div>';
+          htmlC += '<div class="dg-wrap">';
+          htmlC += '<div class="dg-hd"><span>\uD83D\uDD0D Diagnostics captured</span>';
+          htmlC += '<button class="lbtn" id="rrmt-dgclr">\u2715 Clear</button></div>';
           if (State.diagMsg) {
-            html += '<div class="dg-msg">' + esc(State.diagMsg) + '</div>';
+            htmlC += '<div class="dg-msg">' + esc(State.diagMsg) + '</div>';
           }
-          html += '<div class="dg-hint">If copy failed: tap text area below \u2192 triple-tap \u2192 select all \u2192 copy</div>';
-          html += '<textarea class="dg-ta" id="rrmt-dgta" readonly></textarea>';
-          html += '</div>';
+          htmlC += '<div class="dg-hint">If copy failed: tap text area below \u2192 triple-tap \u2192 select all \u2192 copy</div>';
+          htmlC += '<textarea class="dg-ta" id="rrmt-dgta" readonly></textarea>';
+          htmlC += '</div>';
         }
-
-        html += '</div>'; /* /dh-body */
+        htmlC += '</div>';
       }
-      html += '</div>'; /* /dh-wrap */
+      htmlC += '</div>';
 
-      var _savedScroll = $bd.scrollTop;
-      $bd.innerHTML = html;
-      $bd.scrollTop = _savedScroll;  /* preserve scroll position across rerenders */
+      if (!_inputFocused($c)) {
+        $c.innerHTML = htmlC;
+        _wireCfg();
+      }
 
       if ($tgl) $tgl.textContent = State.tracking ? '\u23F8' : '\u25B6';
 
-      /* set textarea values and wire listeners after innerHTML */
-      if (State.diagOutput) {
-        const ta = shadow.getElementById('rrmt-dgta');
-        if (ta) ta.value = State.diagOutput;
-        const clrBtn = shadow.getElementById('rrmt-dgclr');
-        if (clrBtn) clrBtn.addEventListener('click', () => {
-          State.diagOutput = null;
-          State.diagMsg    = null;
+      /* ── Listener wiring: DW section ── */
+      function _wireDw() {
+        $w.querySelectorAll('[data-dw-dismiss]').forEach(function(btn) {
+          btn.addEventListener('click', function() {
+            DisappearanceEngine.dismiss(this.getAttribute('data-dw-dismiss'));
+            render();
+          });
+        });
+        $w.querySelectorAll('[data-dw-outcome]').forEach(function(btn) {
+          btn.addEventListener('click', function() {
+            DisappearanceEngine.setOutcome(this.getAttribute('data-dw-outcome'),
+                                           this.getAttribute('data-dw-label'));
+            render();
+          });
+        });
+        var hospTglEl = shadow.getElementById('rrmt-dw-hosp-tgl');
+        if (hospTglEl) hospTglEl.addEventListener('click', function() {
+          State.dwHospOpen = !State.dwHospOpen;
           render();
         });
       }
 
-      /* Export output textarea — set value and wire Copy All / Clear */
-      if (State.exportOutput) {
-        const expTa = shadow.getElementById('rrmt-exp-ta');
-        if (expTa) expTa.value = State.exportOutput;
-
-        const expCopyEl = shadow.getElementById('rrmt-exp-copy');
-        if (expCopyEl) expCopyEl.addEventListener('click', function () {
-          var ta  = shadow.getElementById('rrmt-exp-ta');
-          var btn = this;
-          if (!ta) return;
-          if (navigator.clipboard && navigator.clipboard.writeText) {
-            navigator.clipboard.writeText(ta.value).then(function () {
-              btn.textContent = '\u2713 Copied';
-              setTimeout(function () { btn.textContent = 'Copy All'; }, 2000);
-            }).catch(function () { ta.setSelectionRange(0, ta.value.length); ta.focus(); });
+      /* ── Listener wiring: cfg + H&D section ── */
+      function _wireCfg() {
+        if (State.diagOutput) {
+          var dgTa = shadow.getElementById('rrmt-dgta');
+          if (dgTa) dgTa.value = State.diagOutput;
+          var clrBtn = shadow.getElementById('rrmt-dgclr');
+          if (clrBtn) clrBtn.addEventListener('click', function() {
+            State.diagOutput = null; State.diagMsg = null; render();
+          });
+        }
+        if (State.exportOutput) {
+          var expTa = shadow.getElementById('rrmt-exp-ta');
+          if (expTa) expTa.value = State.exportOutput;
+          var expCopyEl = shadow.getElementById('rrmt-exp-copy');
+          if (expCopyEl) expCopyEl.addEventListener('click', function() {
+            var ta  = shadow.getElementById('rrmt-exp-ta');
+            var btn = this;
+            if (!ta) return;
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+              navigator.clipboard.writeText(ta.value).then(function() {
+                btn.textContent = '\u2713 Copied';
+                setTimeout(function() { btn.textContent = 'Copy All'; }, 2000);
+              }).catch(function() { ta.setSelectionRange(0, ta.value.length); ta.focus(); });
+            } else {
+              ta.setSelectionRange(0, ta.value.length); ta.focus();
+            }
+          });
+          var expClr = shadow.getElementById('rrmt-exp-clr');
+          if (expClr) expClr.addEventListener('click', function() {
+            State.exportOutput = null; State.exportOutputFn = ''; render();
+          });
+        }
+        if (State.dwImportOpen) {
+          var impTaEl = shadow.getElementById('rrmt-dw-imp-ta');
+          if (impTaEl) {
+            if (State.dwImportText) impTaEl.value = State.dwImportText;
+            impTaEl.addEventListener('input', function() { State.dwImportText = this.value; });
+          }
+        }
+        var scOnEl = shadow.getElementById('rrmt-sc-on');
+        if (scOnEl) scOnEl.addEventListener('change', function() {
+          State.statusEnabled = this.checked;
+          PersistenceStore.savePref(STATUS_PREF_KEY, this.checked);
+          render();
+        });
+        var scKeyEl = shadow.getElementById('rrmt-sc-key');
+        if (scKeyEl) scKeyEl.addEventListener('change', function() {
+          State.apiKey = this.value.trim();
+        });
+        var dwMbEl = shadow.getElementById('rrmt-dw-mb');
+        if (dwMbEl) {
+          dwMbEl.addEventListener('input', function() { State.dwMbDraft = this.value; });
+          dwMbEl.addEventListener('change', function() {
+            var v = parseMinBet(this.value);
+            if (v !== null) {
+              State.dwMbDraft = null;
+              State.dwWatchMin = v;
+              PersistenceStore.savePref(DW_PREF_KEY, v);
+              render();
+            } else {
+              State.dwMbDraft = this.value; /* preserve invalid text — show error feedback */
+              render();
+            }
+          });
+          dwMbEl.addEventListener('blur', function() {
+            /* Preserve invalid draft so error feedback survives blur and subsequent renders */
+            if (State.dwMbDraft === null || parseMinBet(State.dwMbDraft) !== null) {
+              State.dwMbDraft = null;
+            }
+          });
+        }
+        var mbEl = shadow.getElementById('rrmt-mb');
+        if (mbEl) {
+          mbEl.addEventListener('input', function() { State.mbDraft = this.value; });
+          mbEl.addEventListener('change', function() {
+            var v = parseMinBet(this.value);
+            if (v && v > 0) {
+              State.mbDraft = null;
+              State.minBet = v;
+              PersistenceStore.savePref(MIN_BET_PREF_KEY, v);
+              render();
+            } else {
+              State.mbDraft = this.value; /* preserve invalid text — show error feedback */
+              render();
+            }
+          });
+          mbEl.addEventListener('blur', function() {
+            var v = State.mbDraft !== null ? parseMinBet(State.mbDraft) : null;
+            if (State.mbDraft === null || (v !== null && v > 0)) {
+              State.mbDraft = null;
+            }
+          });
+        }
+        var dhTglEl = shadow.getElementById('rrmt-dh-tgl');
+        if (dhTglEl) dhTglEl.addEventListener('click', function() {
+          State.diagHistOpen = !State.diagHistOpen; render();
+        });
+        var dwHistTgl = shadow.getElementById('rrmt-dw-hist-tgl');
+        if (dwHistTgl) dwHistTgl.addEventListener('click', function() {
+          State.dwHistOpen = !State.dwHistOpen; render();
+        });
+        var dwHistPrev = shadow.getElementById('rrmt-dw-hist-prev');
+        if (dwHistPrev) dwHistPrev.addEventListener('click', function() {
+          if (State.dwHistPage > 0) { State.dwHistPage--; render(); }
+        });
+        var dwHistNext = shadow.getElementById('rrmt-dw-hist-next');
+        if (dwHistNext) dwHistNext.addEventListener('click', function() {
+          State.dwHistPage++; render();
+        });
+        function _doExport(text, fname, mime) {
+          State.exportOutput   = text;
+          State.exportOutputFn = fname;
+          State.diagHistOpen   = true;
+          downloadText(fname, mime, text);
+          render();
+          $bd.scrollTop = $bd.scrollHeight;
+          var ta = shadow.getElementById('rrmt-exp-ta');
+          if (ta) ta.value = text;
+        }
+        var expJsonEl = shadow.getElementById('rrmt-dw-exp-json');
+        if (expJsonEl) expJsonEl.addEventListener('click', function() {
+          var ts = new Date().toISOString().slice(0, 10);
+          _doExport(exportHistoryJSON(), 'rrmt-history-' + ts + '.json', 'application/json');
+        });
+        var expCsvEl = shadow.getElementById('rrmt-dw-exp-csv');
+        if (expCsvEl) expCsvEl.addEventListener('click', function() {
+          var ts = new Date().toISOString().slice(0, 10);
+          _doExport(exportHistoryCSV(), 'rrmt-history-' + ts + '.csv', 'text/csv');
+        });
+        var impTglEl = shadow.getElementById('rrmt-dw-imp-tgl');
+        if (impTglEl) impTglEl.addEventListener('click', function() {
+          State.dwImportOpen    = !State.dwImportOpen;
+          State.dwImportError   = '';
+          State.dwImportSuccess = '';
+          if (State.dwImportOpen) State.diagHistOpen = true;
+          render();
+          if (State.dwImportOpen) $bd.scrollTop = $bd.scrollHeight;
+        });
+        var impApplyEl = shadow.getElementById('rrmt-dw-imp-apply');
+        if (impApplyEl) impApplyEl.addEventListener('click', function() {
+          var ta   = shadow.getElementById('rrmt-dw-imp-ta');
+          var text = (ta ? ta.value : State.dwImportText || '').trim();
+          if (!text) { State.dwImportError = 'No data to import'; render(); return; }
+          var result = importHistoryJSON(text);
+          if (result.ok) {
+            State.dwImportOpen    = false;
+            State.dwImportError   = '';
+            State.dwImportText    = '';
+            State.dwImportSuccess = 'Imported\u00a0' + result.added +
+                                    '\u00a0new\u00a0record' + (result.added !== 1 ? 's' : '');
+            PersistenceStore.save(Date.now());
+            DisappearanceEngine.clearDirty();
           } else {
-            ta.setSelectionRange(0, ta.value.length); ta.focus();
+            State.dwImportError = result.error || 'Import failed';
+          }
+          render();
+        });
+        var lbEl = shadow.getElementById('rrmt-lb');
+        if (lbEl) lbEl.addEventListener('click', function() {
+          var txt = exportLog(50);
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(txt).catch(function() { fbCopy(txt); });
+          } else { fbCopy(txt); }
+        });
+        var diagEl = shadow.getElementById('rrmt-diag');
+        if (diagEl) diagEl.addEventListener('click', function() {
+          var txt = captureDomDiag();
+          State.diagOutput   = txt;
+          State.diagMsg      = null;
+          State.diagHistOpen = true;
+          render();
+          var btn = shadow.getElementById('rrmt-diag');
+          var setMsg = function(msg) {
+            State.diagMsg = msg;
+            if (btn) { btn.textContent = msg; setTimeout(function() { btn.textContent = 'Copy DOM diagnostics'; }, 2500); }
+            render();
+          };
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(txt)
+              .then(function() { setMsg('\u2713 Copied to clipboard'); })
+              .catch(function() { setMsg('Clipboard failed \u2014 see text \u2193'); });
+          } else {
+            setMsg('See text \u2193 to copy manually');
           }
         });
-
-        const expClr = shadow.getElementById('rrmt-exp-clr');
-        if (expClr) expClr.addEventListener('click', function () {
-          State.exportOutput = null; State.exportOutputFn = ''; render();
-        });
       }
-
-      /* Import textarea — restore preserved content and wire input handler */
-      if (State.dwImportOpen) {
-        var impTaEl = shadow.getElementById('rrmt-dw-imp-ta');
-        if (impTaEl) {
-          if (State.dwImportText) impTaEl.value = State.dwImportText;
-          impTaEl.addEventListener('input', function () { State.dwImportText = this.value; });
-        }
-      }
-
-      /* Disappearance Watch event listeners */
-      shadow.querySelectorAll('[data-dw-dismiss]').forEach(function (btn) {
-        btn.addEventListener('click', function () {
-          DisappearanceEngine.dismiss(this.getAttribute('data-dw-dismiss'));
-          render();
-        });
-      });
-      shadow.querySelectorAll('[data-dw-outcome]').forEach(function (btn) {
-        btn.addEventListener('click', function () {
-          DisappearanceEngine.setOutcome(this.getAttribute('data-dw-outcome'),
-                                         this.getAttribute('data-dw-label'));
-          render();
-        });
-      });
-      const scOnEl = shadow.getElementById('rrmt-sc-on');
-      if (scOnEl) scOnEl.addEventListener('change', function () {
-        State.statusEnabled = this.checked;
-        PersistenceStore.savePref(STATUS_PREF_KEY, this.checked);
-        render();
-      });
-      const scKeyEl = shadow.getElementById('rrmt-sc-key');
-      if (scKeyEl) scKeyEl.addEventListener('change', function () {
-        /* Store key in State — never log it */
-        State.apiKey = this.value.trim();
-      });
-      const dhTglEl = shadow.getElementById('rrmt-dh-tgl');
-      if (dhTglEl) dhTglEl.addEventListener('click', function () {
-        State.diagHistOpen = !State.diagHistOpen; render();
-      });
-      const dwHistTgl = shadow.getElementById('rrmt-dw-hist-tgl');
-      if (dwHistTgl) dwHistTgl.addEventListener('click', function () {
-        State.dwHistOpen = !State.dwHistOpen; render();
-      });
-
-      const dwHistPrev = shadow.getElementById('rrmt-dw-hist-prev');
-      if (dwHistPrev) dwHistPrev.addEventListener('click', function () {
-        if (State.dwHistPage > 0) { State.dwHistPage--; render(); }
-      });
-      const dwHistNext = shadow.getElementById('rrmt-dw-hist-next');
-      if (dwHistNext) dwHistNext.addEventListener('click', function () {
-        State.dwHistPage++; render();
-      });
-
-      /* Export: always show textarea (mobile-safe); also attempt download on desktop */
-      function _doExport(text, fname, mime) {
-        State.exportOutput   = text;
-        State.exportOutputFn = fname;
-        State.diagHistOpen   = true; /* auto-expand to show export output */
-        downloadText(fname, mime, text);  /* desktop bonus; silently ignored on iOS */
-        render();
-        $bd.scrollTop = $bd.scrollHeight; /* scroll to reveal export textarea */
-        var ta = shadow.getElementById('rrmt-exp-ta');
-        if (ta) ta.value = text;
-      }
-      const expJsonEl = shadow.getElementById('rrmt-dw-exp-json');
-      if (expJsonEl) expJsonEl.addEventListener('click', function () {
-        var ts = new Date().toISOString().slice(0, 10);
-        _doExport(exportHistoryJSON(), 'rrmt-history-' + ts + '.json', 'application/json');
-      });
-      const expCsvEl = shadow.getElementById('rrmt-dw-exp-csv');
-      if (expCsvEl) expCsvEl.addEventListener('click', function () {
-        var ts = new Date().toISOString().slice(0, 10);
-        _doExport(exportHistoryCSV(), 'rrmt-history-' + ts + '.csv', 'text/csv');
-      });
-      const impTglEl = shadow.getElementById('rrmt-dw-imp-tgl');
-      if (impTglEl) impTglEl.addEventListener('click', function () {
-        State.dwImportOpen    = !State.dwImportOpen;
-        State.dwImportError   = '';
-        State.dwImportSuccess = '';
-        if (State.dwImportOpen) State.diagHistOpen = true; /* auto-expand when opening import */
-        render();
-        if (State.dwImportOpen) $bd.scrollTop = $bd.scrollHeight; /* reveal import pane */
-      });
-      const impApplyEl = shadow.getElementById('rrmt-dw-imp-apply');
-      if (impApplyEl) impApplyEl.addEventListener('click', function () {
-        /* Read from live textarea; fall back to State-preserved copy */
-        var ta   = shadow.getElementById('rrmt-dw-imp-ta');
-        var text = (ta ? ta.value : State.dwImportText || '').trim();
-        if (!text) { State.dwImportError = 'No data to import'; render(); return; }
-        var result = importHistoryJSON(text);
-        if (result.ok) {
-          State.dwImportOpen    = false;
-          State.dwImportError   = '';
-          State.dwImportText    = '';
-          State.dwImportSuccess = 'Imported\u00a0' + result.added +
-                                  '\u00a0new\u00a0record' + (result.added !== 1 ? 's' : '');
-          PersistenceStore.save(Date.now());
-          DisappearanceEngine.clearDirty();
-        } else {
-          State.dwImportError = result.error || 'Import failed';
-        }
-        render();
-      });
-
-      const mbEl = shadow.getElementById('rrmt-mb');
-      if (mbEl) mbEl.addEventListener('change', function () {
-        const v = parseMinBet(this.value);
-        if (v && v > 0) { State.minBet = v; PersistenceStore.savePref(MIN_BET_PREF_KEY, v); render(); }
-      });
-
-      const dwMbEl = shadow.getElementById('rrmt-dw-mb');
-      if (dwMbEl) dwMbEl.addEventListener('change', function () {
-        var v = parseMinBet(this.value);
-        if (v !== null) {
-          State.dwWatchMin = v;
-          PersistenceStore.savePref(DW_PREF_KEY, v);
-          render();
-        }
-      });
-
-      const hospTglEl = shadow.getElementById('rrmt-dw-hosp-tgl');
-      if (hospTglEl) hospTglEl.addEventListener('click', function () {
-        State.dwHospOpen = !State.dwHospOpen;
-        render();
-      });
-
-      const lbEl = shadow.getElementById('rrmt-lb');
-      if (lbEl) lbEl.addEventListener('click', () => {
-        const txt = exportLog(50);
-        if (navigator.clipboard && navigator.clipboard.writeText) {
-          navigator.clipboard.writeText(txt).catch(() => fbCopy(txt));
-        } else { fbCopy(txt); }
-      });
-
-      const diagEl = shadow.getElementById('rrmt-diag');
-      if (diagEl) diagEl.addEventListener('click', () => {
-        const txt = captureDomDiag();
-        State.diagOutput   = txt;
-        State.diagMsg      = null;
-        State.diagHistOpen = true; /* auto-expand to show diagnostics */
-        render();
-
-        /* attempt clipboard copy after render (button ref may be stale — look it up again) */
-        const btn = shadow.getElementById('rrmt-diag');
-        const setMsg = (msg, colour) => {
-          State.diagMsg = msg;
-          const ta = shadow.getElementById('rrmt-dghd');
-          if (btn) { btn.textContent = msg; setTimeout(() => { btn.textContent = 'Copy DOM diagnostics'; }, 2500); }
-          render();
-        };
-
-        if (navigator.clipboard && navigator.clipboard.writeText) {
-          navigator.clipboard.writeText(txt)
-            .then(() => setMsg('\u2713 Copied to clipboard', '#5cb85c'))
-            .catch(() => setMsg('Clipboard failed \u2014 see text \u2193', '#b07070'));
-        } else {
-          setMsg('See text \u2193 to copy manually', '#8060a0');
-        }
-      });
     }
 
     function fbCopy(text) {
@@ -2968,7 +3091,7 @@
     function destroy() {
       stopTracking();
       if (host && host.parentNode) host.parentNode.removeChild(host);
-      host = null; shadow = null; $fab = $ov = $tgl = $cls = $bd = null;
+      host = null; shadow = null; $fab = $ov = $tgl = $cls = $bd = $g = $w = $c = null;
     }
 
     function attach() {
@@ -2995,13 +3118,20 @@
           '<div class="hd"><div class="ttl">RR Mug Tracker<small>v' + VERSION + '</small></div>' +
             '<button class="ib" id="rrmt-tgl" title="Toggle tracking">\u25B6</button>' +
             '<button class="ib x" id="rrmt-cls">\u2715</button>' +
-          '</div><div class="bd" id="rrmt-bd"></div></div></div>';
+          '</div><div class="bd" id="rrmt-bd">' +
+            '<div id="rrmt-bd-g"></div>' +
+            '<div id="rrmt-bd-w"></div>' +
+            '<div id="rrmt-bd-c"></div>' +
+          '</div></div></div>';
       shadow.appendChild(tpl.content ? tpl.content.cloneNode(true) : tpl);
       $fab = shadow.getElementById('rrmt-fab');
       $ov  = shadow.getElementById('rrmt-ov');
       $tgl = shadow.getElementById('rrmt-tgl');
       $cls = shadow.getElementById('rrmt-cls');
       $bd  = shadow.getElementById('rrmt-bd');
+      $g   = shadow.getElementById('rrmt-bd-g');
+      $w   = shadow.getElementById('rrmt-bd-w');
+      $c   = shadow.getElementById('rrmt-bd-c');
       if ($fab) $fab.addEventListener('click', open);
       if ($cls) $cls.addEventListener('click', close);
       if ($tgl) $tgl.addEventListener('click', () => State.tracking ? stopTracking() : (startTracking(), render()));
@@ -3067,6 +3197,7 @@
         PersistenceStore,
         DE_HISTORY_MAX, DE_STORE_VERSION,
         DW_PREF_KEY, DEFAULT_DW_MIN_BET, DEFAULT_MIN_BET, STATUS_PREF_KEY, MIN_BET_PREF_KEY,
+        LOBBY_FRESH_MS, STATUS_STALE_MS,
         exportHistoryJSON, exportHistoryCSV, importHistoryJSON,
       };
     }
