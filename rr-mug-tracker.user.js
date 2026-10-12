@@ -1,7 +1,9 @@
 // ==UserScript==
 // @name         RR Mug Tracker
 // @namespace    fatboy.torn
-// @version      1.1.4
+// @version      1.1.5
+// @downloadURL  https://raw.githubusercontent.com/333ammo/rr-mug-tracker/main/rr-mug-tracker.user.js
+// @updateURL    https://raw.githubusercontent.com/333ammo/rr-mug-tracker/main/rr-mug-tracker.user.js
 // @description  Russian Roulette lobby tracker with disappearance-watch intelligence for Torn PDA (iOS) and desktop.
 // @author       FATBOY [572123]
 // @match        https://www.torn.com/page.php*
@@ -13,7 +15,24 @@
 // ==/UserScript==
 
 /*
- * RR Mug Tracker v1.1.3 — Settings persistence fix, DW flush-on-navigate, hospital attack block, timer labels.
+ * RR Mug Tracker v1.1.5 — Status freshness labels, API snapshot age, hospital recovery guard, input previews, DW viewport, contrast.
+ *
+ * v1.1.5 changes:
+ *   - Status labels now distinguish API snapshot age from request receipt time. Lobby and DW
+ *     display "API\u202FOkay · Ns ago" where Ns is the age of the Torn API snapshot (apiTs).
+ *   - lobbyStatus entries now store apiTs alongside ts and error.
+ *   - Entry fields latestApiTs and hospitalisedApiTs added. Recovery from HOSPITAL to CONFIRMED
+ *     requires the new Okay response's apiTs to be strictly newer than the apiTs that established
+ *     the HOSPITAL state (when both are available), preventing same-snapshot false recovery.
+ *   - Priority scoring reason strings prefixed with "API:" to communicate evidence source.
+ *   - Min Bet and Min Watch Bet inputs show a full-dollar preview of the interpreted value.
+ *     Very small thresholds (< $1M) display a compact warning.
+ *   - DW active card list wrapped in a bounded scroll container (max-height: 44vh) so multiple
+ *     watches do not push settings and H&D off the iPhone screen.
+ *   - Secondary text contrast improved: priority reasons, outcome buttons, status labels,
+ *     countdown text, settings helper text, hospital labels.
+ *
+ * v1.1.4 changes:
  *
  * v1.1.3 changes:
  *   - Bug fix (CRITICAL): Min Bet preference was never saved to storage — reverted to $200M on every
@@ -422,7 +441,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.1.4';
+  const VERSION = '1.1.5';
   if (window.top !== window.self) return;
 
   /* isRRPage accepts optional (pn, qs) args for test-harness use */
@@ -470,6 +489,7 @@
   const STATUS_PREF_KEY         = 'rrmt_status_pref'; /* saves user ON/OFF preference */
   const LOBBY_FRESH_MS          = 5 * 60 * 1000;      /* lobby status freshness threshold */
   const STATUS_STALE_MS         = 5 * 60 * 1000;      /* age at which Okay becomes Stale */
+  const SMALL_BET_WARN          = 1000000;                /* full-dollar preview warning threshold */
 
   /* Profile-link texts that are UI chrome, not player names */
   const UI_LABEL = /^(view\s+profile\.?|premium\s+data|follow|unfollow|report|trade|send\s+message|send\s+gift|bounty|add\s+to\s+friend)$/i;
@@ -499,7 +519,7 @@
     dwHospOpen:      false,               // hospital/inactive subsection expanded
     mbDraft:         null,    // unfinished Min Bet text; null = use fmtBet(State.minBet)
     dwMbDraft:       null,    // unfinished Min Watch Bet text; null = use fmtBet(State.dwWatchMin)
-    lobbyStatus:     new Map(), // playerId → { status, ts, error } — lobby hospital checks
+    lobbyStatus:     new Map(), // playerId → { status, ts, apiTs, error } — lobby hospital checks
   };
 
   /* ============================ 3. PARSING ============================ */
@@ -1092,6 +1112,11 @@
     return '$' + n.toLocaleString();
   }
 
+  function fmtFull(n) {
+    if (n == null || isNaN(n)) return '?';
+    return '$' + Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  }
+
   function formatAge(firstSeen, now) {
     if (firstSeen == null) return 'Age unknown';
     const ms = (now != null ? now : Date.now()) - firstSeen;
@@ -1235,6 +1260,7 @@
   }
 
   function stopTracking() {
+    StatusChecker.cancelPending();
     if (!State.tracking) return;
     State.tracking = false;
     logEvent('TRACKING_PAUSED');
@@ -1441,6 +1467,8 @@
         hospitalReason:null,   /* HOSP_REASONS code */
         hospitalLabel: null,   /* human-readable hospital classification */
         hospitalUntil: null,   /* seconds epoch: when hospital ends (from API) */
+        latestApiTs:   null,   /* apiTs of the most recent latestStatus update */
+        hospitalisedApiTs: null, /* apiTs when HOSPITAL state was established */
         statusObs:     [],     /* [{state, description, ts}] — last 10 observations */
       };
     }
@@ -1468,13 +1496,36 @@
       /* Filter out ERROR slots and stale pre-disappearance API data */
       var checks = entry.statusChecks.filter(function (c) {
         if (!c.result || c.result === 'ERROR') return false;
-        if (c.apiTs !== null && typeof c.apiTs === 'number' && c.apiTs < entry.confirmedTs) return false;
+        if (typeof c.apiTs === 'number' && isFinite(c.apiTs) && c.apiTs < entry.confirmedTs) return false;
         return true;
       });
       var okays = checks.filter(function (c) { return c.result === 'Okay'; });
+
+      /* De-duplicate Okay observations: same apiTs = same Torn snapshot, not independent evidence.
+         Null-apiTs slots are excluded from freshness bonuses (unknown timestamp). */
+      var _seenApiTs = {};
+      var uniqueOkays = okays.filter(function (c) {
+        if (typeof c.apiTs !== 'number' || !isFinite(c.apiTs)) return false;
+        if (_seenApiTs[c.apiTs]) return false;
+        _seenApiTs[c.apiTs] = true;
+        return true;
+      });
+
+      /* +15s slot qualifies only when its apiTs is known AND was generated at or after the
+         scheduled check time.  The scheduled time is confirmedTs + 15000; when scheduledAt is
+         stored on the slot we use it directly.  An apiTs predating the scheduled time means the
+         Torn server assembled the response before the +15s boundary was reached, so it cannot
+         prove the player was still Okay at that point.
+         Note: apiTs is the Torn response-assembly timestamp — it is NOT proof that the underlying
+         player-status data inside the response was refreshed at that exact moment. */
       var ok15  = entry.statusChecks.find(function (c) {
         if (c.offset !== 15000 || c.result !== 'Okay') return false;
-        if (c.apiTs !== null && typeof c.apiTs === 'number' && c.apiTs < entry.confirmedTs) return false;
+        if (typeof c.apiTs !== 'number' || !isFinite(c.apiTs)) return false;
+        var boundary = entry.confirmedTs + 15000;
+        if (typeof c.scheduledAt === 'number' && isFinite(c.scheduledAt)) {
+          boundary = Math.max(boundary, c.scheduledAt);
+        }
+        if (c.apiTs < boundary) return false;
         return true;
       });
 
@@ -1499,19 +1550,20 @@
       }
       if (betBonus > 0) components.push({ value: betBonus, reason: 'Wager ' + formatBet(entry.bet) });
 
-      /* Status evidence (+0 to +25) */
+      /* Status evidence (+0 to +25). Only uniqueOkays (de-duped, known timestamp) earn bonuses. */
       var statusBonus = 0, statusReasons = [];
-      if (ok15)             { statusBonus = 20; statusReasons.push('Okay at +15\u202Fs'); }
-      else if (okays.length){ statusBonus = 10; statusReasons.push('Okay observed'); }
-      if (okays.length > 1) {
-        statusBonus = Math.min(statusBonus + Math.min(5 * (okays.length - 1), 5), 25);
-        statusReasons.push('Okay \xd7' + okays.length);
+      if (ok15)                    { statusBonus = 20; statusReasons.push('API\u202FOkay\u00a0+15s'); }
+      else if (uniqueOkays.length) { statusBonus = 10; statusReasons.push('API\u202FOkay\u00a0obs.'); }
+      if (uniqueOkays.length > 1) {
+        statusBonus = Math.min(statusBonus + Math.min(5 * (uniqueOkays.length - 1), 5), 25);
+        statusReasons.push('API\u202FOkay\u00d7' + uniqueOkays.length);
       }
       if (statusBonus > 0) components.push({ value: statusBonus, reason: statusReasons.join('; ') });
 
-      /* Uncertainty penalty */
-      if      (!checks.length) components.push({ value: -10, reason: 'No checks yet' });
-      else if (!okays.length)  components.push({ value:  -5, reason: 'Checked \u2014 never Okay' });
+      /* Uncertainty penalty: uses all okays (including null-apiTs); null-apiTs Okay is acknowledged
+         but earns no bonus — it is not penalised as if no Okay was ever received. */
+      if      (!checks.length)  components.push({ value: -10, reason: 'No checks yet' });
+      else if (!okays.length)   components.push({ value:  -5, reason: 'Checked \u2014 never Okay' });
 
       /* Compute raw score */
       var rawScore = 0;
@@ -1699,7 +1751,8 @@
       var due = [];
       var _dqThresh = State.dwWatchMin; /* v1.1.2: only DW threshold gates status checks */
       _watches.forEach(function (entry) {
-        if (entry.state !== 'CONFIRMED') return;
+        /* HOSPITAL entries retain their existing scheduled slots so recovery can be detected. */
+        if (entry.state !== 'CONFIRMED' && entry.state !== 'HOSPITAL') return;
         if (!entry.playerId || !/^\d+$/.test(entry.playerId)) return;
         if (_dqThresh > 0 && entry.bet !== null && entry.bet !== undefined && entry.bet < _dqThresh) return;
         for (var i = 0; i < entry.statusChecks.length; i++) {
@@ -1775,26 +1828,56 @@
       if (!entry) return;
       if (entry.state !== 'CONFIRMED' && entry.state !== 'HOSPITAL') return;
       var isLatest = (entry.latestStatusTs === null || ts >= entry.latestStatusTs);
-      if (isLatest) {
+      /* Record raw observation for diagnostics (always, before state transitions). */
+      if (!Array.isArray(entry.statusObs)) entry.statusObs = [];
+      entry.statusObs.push({ state: status, description: description || '', ts: ts, apiTs: apiTs || null });
+      if (entry.statusObs.length > 10) entry.statusObs.shift();
+      /* Normalise apiTs: reject null, undefined, NaN, Infinity. */
+      var _apiTs = (apiTs !== null && apiTs !== undefined && isFinite(apiTs)) ? apiTs : null;
+      if (status === 'Hospital' && isLatest) {
+        /* Hospital: update effective status, classify reason, track maximum known Hospital apiTs.
+           hospitalisedApiTs is the highest confirmed Hospital apiTs; tracking the maximum prevents
+           an older out-of-order Hospital response from lowering the barrier for recovery. */
         entry.latestStatus   = status;
         entry.latestStatusTs = ts;
-      }
-      /* Record raw observation (capped at 10) */
-      if (!Array.isArray(entry.statusObs)) entry.statusObs = [];
-      entry.statusObs.push({ state: status, description: description || '', ts: ts });
-      if (entry.statusObs.length > 10) entry.statusObs.shift();
-      /* Hospital: classify reason, mark suppressed */
-      if (status === 'Hospital' && isLatest) {
-        entry.state       = 'HOSPITAL';
-        entry.stateReason = 'Host in hospital — not actionable';
+        entry.latestApiTs    = _apiTs;
+        entry.state          = 'HOSPITAL';
+        entry.stateReason    = 'Host in hospital \u2014 not actionable';
+        if (_apiTs !== null && (entry.hospitalisedApiTs === null || _apiTs > entry.hospitalisedApiTs)) {
+          entry.hospitalisedApiTs = _apiTs;
+        }
         var cls = classifyHospitalReason(status, description, details);
         entry.hospitalReason = cls.code;
         entry.hospitalLabel  = cls.label;
         if (typeof until === 'number') entry.hospitalUntil = until;
       } else if (status === 'Okay' && isLatest && entry.state === 'HOSPITAL') {
-        /* Recovery: a newer Okay confirms the player left hospital — restore to actionable */
-        entry.state       = 'CONFIRMED';
-        entry.stateReason = 'Recovered \u2014 status: Okay';
+        /* Recovery from HOSPITAL: BOTH the Okay apiTs and the hospitalisedApiTs must be known,
+           finite, and the Okay must be strictly newer.
+           Conservative rules — any missing or incomparable timestamp keeps Hospital protection:
+             - Unknown Okay apiTs (null) cannot prove recovery.
+             - Unknown Hospital baseline (hospitalisedApiTs null, e.g. loaded from an old save or
+               established with a null-apiTs response) — cannot compare, so recovery is blocked until
+               a fresh Hospital check with a known apiTs establishes a new baseline.
+           If recovery is rejected, latestStatus is NOT updated — a rejected Okay is preserved
+           in statusObs only for diagnostics. Subsequent checks with newer valid apiTs can still
+           establish recovery once the baseline is known. */
+        var _hospTs = (entry.hospitalisedApiTs !== null && isFinite(entry.hospitalisedApiTs))
+                      ? entry.hospitalisedApiTs : null;
+        var canRecover = (_apiTs !== null && _hospTs !== null && _apiTs > _hospTs);
+        if (canRecover) {
+          entry.latestStatus   = status;
+          entry.latestStatusTs = ts;
+          entry.latestApiTs    = _apiTs;
+          entry.state          = 'CONFIRMED';
+          entry.stateReason    = 'Recovered \u2014 status: Okay';
+        }
+        /* else: recovery rejected — latestStatus stays Hospital, observation in statusObs */
+      } else if (isLatest) {
+        /* All other cases: Okay for CONFIRMED, Jail/Traveling for any state, etc.
+           Update effective status; state machine unchanged. */
+        entry.latestStatus   = status;
+        entry.latestStatusTs = ts;
+        entry.latestApiTs    = _apiTs;
       }
       var pr = _computePriority(entry, ts);
       entry.priority       = pr.score;
@@ -1835,6 +1918,7 @@
         if (_watches.has(w.gameId)) continue;
         var restored = Object.assign({
           hospitalReason: null, hospitalLabel: null, hospitalUntil: null, statusObs: [],
+          latestApiTs: null, hospitalisedApiTs: null,
         }, w, {
           statusChecks: Array.isArray(w.statusChecks)
             ? w.statusChecks.map(function (s) { return Object.assign({}, s); })
@@ -1864,6 +1948,7 @@
         if (!h || !h.gameId || existingIds.has(h.gameId)) continue;
         _history.push(Object.assign({
           hospitalReason: null, hospitalLabel: null, hospitalUntil: null, statusObs: [],
+          latestApiTs: null, hospitalisedApiTs: null,
         }, h, {
           statusChecks: Array.isArray(h.statusChecks)
             ? h.statusChecks.map(function (s) { return Object.assign({}, s); }) : [],
@@ -2049,6 +2134,17 @@
     let _inFlightPlayerId = null;
     let _lastAt          = 0;
     let _currentToken    = null;  /* invalidated on force-clear; callbacks check identity */
+    let _mockTransport   = null;  /* test-only: overrides _doFetch when set */
+
+    function _setTransport(fn) { _mockTransport = (typeof fn === 'function') ? fn : null; }
+    function _getLastAt() { return _lastAt; }
+
+    function cancelPending() {
+      _currentToken = null;
+      _inFlight = false;
+      _inFlightSince = 0;
+      _inFlightPlayerId = null;
+    }
 
     function _isClientError(err) {
       if (!err) return false;
@@ -2057,14 +2153,74 @@
     }
 
     function _doFetchWithRetry(playerId, key, cb) {
+      /* Capture the request start set by caller so the retry can enforce DE_RATE_MS from it. */
+      var _requestStart = _lastAt;
+      var requestToken = _currentToken;
       _doFetch(playerId, key, function (status, err, apiTs, description, details, until) {
         if (!status && !_isClientError(err)) {
-          /* Transient failure — single retry after brief delay */
-          setTimeout(function () { _doFetch(playerId, key, cb); }, DE_RETRY_DELAY_MS);
+          /* Transient failure — single retry.
+             Delay = max(DE_RETRY_DELAY_MS, DE_RATE_MS - elapsed_since_original_request_start)
+             so the retry never starts sooner than DE_RATE_MS after the first real HTTP attempt.
+             _lastAt is updated when the retry actually begins, not when it is scheduled. */
+          var elapsed    = Date.now() - _requestStart;
+          var retryDelay = Math.max(DE_RETRY_DELAY_MS, DE_RATE_MS - elapsed);
+          function retry() {
+            /* An old callback must never cancel or dispatch on behalf of a newer request. */
+            if (!requestToken || _currentToken !== requestToken) return;
+            if (!State.tracking || !State.statusEnabled || _effectiveKey() !== key) {
+              cancelPending();
+              return;
+            }
+            /* Recheck the shared gate at dispatch, including after lifecycle cancellation. */
+            var wait = DE_RATE_MS - (Date.now() - _lastAt);
+            if (wait > 0) { setTimeout(retry, wait); return; }
+            _lastAt = Date.now();
+            _doFetch(playerId, key, cb);
+          }
+          setTimeout(retry, retryDelay);
         } else {
           cb(status, err, apiTs, description, details, until);
         }
       });
+    }
+
+    /* Write to the lobby status cache with hospital-evidence protection.
+       Existing confirmed Hospital is overwritten only by:
+         - Another Hospital result — maximum known apiTs is tracked; an older snapshot cannot
+           downgrade the barrier that guards recovery.
+         - An Okay result whose apiTs is KNOWN AND STRICTLY NEWER than the maximum stored
+           Hospital apiTs.  Only Okay may establish recovery; Jail, Traveling, and any other
+           non-Okay non-Hospital status are not recovery signals.
+       Conservative recovery rules — null, non-finite or equal timestamps all keep Hospital:
+         - If the incoming Okay apiTs is null or non-finite → reject (unknown timestamp cannot prove recovery).
+         - If the stored Hospital apiTs is null or non-finite → reject (cannot compare without a known
+           Hospital baseline).
+         - If incoming Okay apiTs <= stored Hospital apiTs → reject (older or same snapshot).
+       Errors never clear an existing Hospital; they preserve it with a refreshed receipt time. */
+    function _saferLobbySet(playerId, newStatus, ts, apiTs, err) {
+      var ex = State.lobbyStatus.get(playerId);
+      if (ex && ex.status === 'Hospital') {
+        if (!newStatus) {
+          /* Request error — preserve Hospital, refresh receipt time only */
+          State.lobbyStatus.set(playerId, { status: 'Hospital', ts: ts, apiTs: ex.apiTs, error: err || null });
+          return;
+        }
+        if (newStatus === 'Hospital') {
+          /* Hospital-to-Hospital — track maximum known apiTs; older response must not downgrade barrier */
+          var _newA = (apiTs !== null && isFinite(apiTs)) ? apiTs : null;
+          var _exA  = (ex.apiTs !== null && isFinite(ex.apiTs)) ? ex.apiTs : null;
+          var _keepA = (_newA !== null && (_exA === null || _newA > _exA)) ? _newA : _exA;
+          State.lobbyStatus.set(playerId, { status: 'Hospital', ts: ts, apiTs: _keepA, error: null });
+          return;
+        }
+        /* Non-Hospital: only Okay may establish recovery; Jail/Traveling/etc. are not recovery */
+        if (newStatus !== 'Okay') return;
+        /* Okay recovery: both timestamps must be known, finite, and strictly newer */
+        if (apiTs === null || !isFinite(apiTs)) return;        /* unknown/invalid Okay apiTs — reject */
+        if (ex.apiTs === null || !isFinite(ex.apiTs)) return;  /* unknown Hospital apiTs — cannot compare, reject */
+        if (apiTs <= ex.apiTs) return;                         /* older or equal — reject */
+      }
+      State.lobbyStatus.set(playerId, { status: newStatus || null, ts: ts, apiTs: apiTs || null, error: err || null });
     }
 
     function _effectiveKey() {
@@ -2102,6 +2258,7 @@
     }
 
     function _doFetch(playerId, key, cb) {
+      if (_mockTransport) { _mockTransport(playerId, key, cb); return; }
       var url = 'https://api.torn.com/v2/user/' + encodeURIComponent(playerId) +
                 '/basic?key=' + encodeURIComponent(key);
       if (typeof PDA_httpGet === 'function') {
@@ -2227,8 +2384,8 @@
             item.slot.ts     = ts;
             item.slot.apiTs  = apiTs || null;
             DisappearanceEngine._updateStatusResult(item.gameId, status, ts, apiTs, description, details, until);
-            /* Share result — prevents a redundant lobby check for the same player */
-            State.lobbyStatus.set(item.playerId, { status: status, ts: ts, error: null });
+            /* Share result — prevents a redundant lobby check; hospital-protection rules enforced */
+            _saferLobbySet(item.playerId, status, ts, apiTs, null);
             /* Cap size — _getLobbyDue() normally prunes, but DW checks may run without it */
             if (State.lobbyStatus.size > 200) {
               var _lsByAge = Array.from(State.lobbyStatus.entries())
@@ -2264,7 +2421,7 @@
           _inFlightSince    = 0;
           _inFlightPlayerId = null;
           var ts = Date.now();
-          State.lobbyStatus.set(lobbyPlayerId, { status: status || null, ts: ts, error: err || null });
+          _saferLobbySet(lobbyPlayerId, status || null, ts, apiTs || null, err || null);
           UI.render();
         });
       }
@@ -2291,9 +2448,18 @@
       _inFlightPlayerId = null;
     }
 
-    return { tick, canCheck, checkingPlayerId,
+    /* Test-only: call _doFetchWithRetry as tick() would, setting _lastAt first.
+       Allows deterministic retry-delay assertions without fighting the rate gate. */
+    function _testDoFetchWithRetry(playerId, key, cb) {
+      _lastAt = Date.now();
+      _doFetchWithRetry(playerId, key, cb);
+    }
+
+    return { tick, canCheck, checkingPlayerId, cancelPending,
              _parseRespTest, _testState, _testSetFlight, _testForceExpireClear,
-             _testGetLobbyDue: _getLobbyDue };
+             _testGetLobbyDue: _getLobbyDue,
+             _setTransport, _getLastAt, _testDoFetchWithRetry,
+             _saferLobbySet };
   })();
 
   /* ============================ 11. EXPORT / IMPORT HELPERS ============================ */
@@ -2371,6 +2537,7 @@
   const UI = (function () {
     let host = null, shadow = null, _open = false;
     let $fab, $ov, $tgl, $cls, $bd, $g, $w, $c;
+    let _shadowActiveFallback = null; /* Firefox: shadow.activeElement may lag; track via focusin/focusout */
 
     const CSS = [
       ':host{all:initial}*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}',
@@ -2392,14 +2559,15 @@
       '.gnm{font-weight:600;color:#c080f0;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1 1 0}',
       '.gid{font-size:10px;color:#9070b0;flex-shrink:0;font-weight:400;white-space:nowrap}',
       '.gx{font-size:11px;color:#9070b0;margin-top:2px}',
-      '.ga{font-size:11px;color:#9080b0;margin-top:1px}',
-      '.ge{font-size:10px;color:#9080b0;font-style:italic}',
+      '.ga{font-size:11px;color:#a898c8;margin-top:1px}',
+      '.ge{font-size:10px;color:#a898c8;font-style:italic}',
       '.gs{font-size:10px;margin-top:2px;padding:1px 0}',
       '.gs.ok{color:#5cb85c}',
+      '.gs.neu{color:#a898c8}',
       '.gs.ho{color:#d09050}',
       '.gs.stale{color:#8070a0}',
-      '.gs.chk{color:#7080c0;font-style:italic}',
-      '.gs.pnd{color:#5a4a7a}',
+      '.gs.chk{color:#8898d8;font-style:italic}',
+      '.gs.pnd{color:#7868a8}',
       '.gl{display:flex;gap:5px;margin-top:5px}',
       '.gl a{flex:1;padding:5px 2px;text-align:center;border-radius:5px;border:1px solid #3a1a5a;background:#0c0420;color:#9070b0;font-size:11px;font-weight:600;text-decoration:none;touch-action:manipulation;-webkit-tap-highlight-color:transparent;display:block;cursor:pointer}',
       '.gl a.dis{opacity:.35;pointer-events:none;cursor:default}',
@@ -2407,7 +2575,7 @@
       '.ok{color:#5cb85c}',
       '.empty{padding:18px 0;text-align:center;color:#4a3060;font-size:12px}',
       '.warn{padding:7px 9px;margin-bottom:5px;border-radius:6px;background:#1e1010;border:1px solid #4a1a1a;color:#b07070;font-size:11px}',
-      '.cfg{padding:6px 0 3px;border-top:1px solid #1e1030;margin-top:4px;font-size:11px;color:#6a4a80;display:flex;align-items:center;gap:6px;flex-wrap:wrap}',
+      '.cfg{padding:6px 0 3px;border-top:1px solid #1e1030;margin-top:4px;font-size:11px;color:#8a6a98;display:flex;align-items:center;gap:6px;flex-wrap:wrap}',
       '.cfg input{flex:1;min-width:90px;max-width:150px;padding:4px 7px;border-radius:5px;border:1px solid #3a1a5a;background:#080410;color:#ddd0f0;font:11px inherit}',
       '.lbtn{margin-top:5px;padding:5px 10px;border-radius:6px;border:1px solid #3a1a5a;background:#100820;color:#8060a0;font-size:11px;touch-action:manipulation}',
       /* disappearance watch */
@@ -2420,27 +2588,30 @@
       '.dwp{display:inline-block;min-width:26px;height:16px;border-radius:8px;text-align:center;font-size:9px;font-weight:700;line-height:16px;padding:0 4px;margin-right:4px;background:#2a1040;color:#c080f0}',
       '.dwp.hi{background:#4a1020;color:#f08080}',
       '.dwn{font-weight:600;color:#c080f0;font-size:12px}',
-      '.dwid{font-size:10px;color:#9070b0;margin-left:3px}',
-      '.dwx{font-size:11px;color:#9070b0;margin-top:2px}',
-      '.dwst{font-size:10px;color:#9070b0;margin-top:1px}',
+      '.dwid{font-size:10px;color:#a888c8;margin-left:3px}',
+      '.dwx{font-size:11px;color:#a888c8;margin-top:2px}',
+      '.dwst{font-size:10px;color:#a888c8;margin-top:1px}',
       '.dwst.ok{color:#5cb85c}',
       '.dwst.ho{color:#c09040}',
-      '.dwrsn{font-size:10px;color:#a070c0;margin-top:2px;font-style:italic}',
+      '.dwrsn{font-size:10px;color:#b898d8;margin-top:2px;font-style:italic}',
       '.dwbr{display:flex;gap:4px;margin-top:5px;flex-wrap:wrap}',
       '.dwbr a,.dwbr button{padding:3px 8px;border-radius:4px;font-size:10px;font-weight:600;text-decoration:none;border:1px solid #3a1a5a;background:#0c0420;color:#9070b0;cursor:pointer;font-family:inherit;touch-action:manipulation;-webkit-tap-highlight-color:transparent}',
       '.dwbr a.ico{font-size:14px;padding:4px 9px;min-width:34px;min-height:28px;display:inline-flex;align-items:center;justify-content:center;line-height:1}',
       '.dwbr a.atk{border-color:#4a1a2a;color:#c06070}',
       '.dwbr .dis{opacity:.35;pointer-events:none}',
-      '.dwbr .dsm{color:#4a3060}',
-      '.dwbr .oc{color:#6a4a60}',
+      '.dwbr .dsm{color:#6a5080}',
+      '.dwbr .oc{color:#8a6a80}',
       '.dwbr .oc.sel{border-color:#5a3060;color:#c080f0}',
-      '.dw-cfg{margin-top:5px;font-size:10px;color:#6a4a80;display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding-top:5px;border-top:1px solid #1e1030}',
+      '.dw-cfg{margin-top:5px;font-size:10px;color:#8a6a98;display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding-top:5px;border-top:1px solid #1e1030}',
       '.dw-cfg label{display:flex;align-items:center;gap:4px;cursor:pointer}',
       '.dw-cfg input[type=checkbox]{width:13px;height:13px;accent-color:#8040c0;cursor:pointer}',
       '.dw-cfg input[type=password]{max-width:130px;padding:3px 6px;border-radius:4px;border:1px solid #3a1a5a;background:#080410;color:#ddd0f0;font:10px inherit}',
       '.dw-cfg input[type=text]{width:60px;padding:3px 6px;border-radius:4px;border:1px solid #3a1a5a;background:#080410;color:#ddd0f0;font:10px inherit}',
       '.inp-err{font-size:10px;color:#c05050;margin-left:2px}',
-      '.dw-cnt{font-size:10px;color:#8060a0;padding:4px 0 2px}',
+      '.inp-hint{font-size:10px;color:#7a90a0;margin-left:3px}',
+      '.inp-hint.warn-small{color:#b07840}',
+      '.dw-list{max-height:44vh;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;padding-right:2px}',
+      '.dw-cnt{font-size:10px;color:#a080c0;padding:4px 0 2px}',
       '.dwnt{color:#7a5090;font-variant-numeric:tabular-nums}',
       '.dw-hist{margin-top:4px;padding-top:4px;border-top:1px solid #1e1030;font-size:10px;color:#5a4070}',
       '.dw-hist-item{padding:2px 0;display:flex;gap:5px;align-items:baseline;flex-wrap:wrap}',
@@ -2450,15 +2621,15 @@
       '.dw-hist-oc.T{color:#6070a0}',
       '.dw-empty{font-size:11px;color:#6a4a7a;padding:8px 0;text-align:center}',
       /* hospital / inactive subsection */
-      '.dw-legend{font-size:9px;color:#7a5a8a;padding:2px 0 4px;letter-spacing:.01em}',
-      '.dw-legend span{color:#9070aa}',
-      '.dw-prinfo{font-size:9px;color:#7a5a8a;padding:1px 0 4px;font-style:italic}',
+      '.dw-legend{font-size:9px;color:#9a78aa;padding:2px 0 4px;letter-spacing:.01em}',
+      '.dw-legend span{color:#b090c8}',
+      '.dw-prinfo{font-size:9px;color:#9a78aa;padding:1px 0 4px;font-style:italic}',
       '.dw-stale{color:#8070a0}',
       '.dw-hosp-noatk{font-size:9px;color:#9a7050;padding:3px 7px;border-radius:4px;border:1px solid #2a1a1a;background:#100808;white-space:nowrap}',
       '.dw-hosp-wrap{margin-top:5px;padding-top:4px;border-top:1px solid #1e1030}',
       '.dw-hosp-tgl{display:flex;width:100%;align-items:center;justify-content:space-between;padding:4px 7px;border-radius:5px;border:1px solid #2a1a3a;background:#0a0418;color:#6a4a6a;font-size:10px;font-weight:600;cursor:pointer;touch-action:manipulation}',
       '.dw-hosp-badge{font-size:9px;background:#1a1a3a;border-radius:8px;padding:1px 5px;color:#6a6090;margin-left:2px}',
-      '.dw-hosp-lbl{font-size:9px;color:#7a5040;margin-left:5px;font-style:italic}',
+      '.dw-hosp-lbl{font-size:9px;color:#a87060;margin-left:5px;font-style:italic}',
       '.dw-hosp-body{padding-top:3px}',
       '.dw-exp-row{display:flex;gap:4px;flex-wrap:wrap;margin-top:5px;padding-top:4px;border-top:1px solid #1e1030}',
       /* collapsible History & Diagnostics */
@@ -2488,7 +2659,7 @@
     }
 
     function _inputFocused(container) {
-      var ae = shadow && shadow.activeElement;
+      var ae = (shadow && shadow.activeElement) || _shadowActiveFallback;
       return !!(ae && container && container.contains(ae) &&
                 (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.tagName === 'SELECT'));
     }
@@ -2550,15 +2721,21 @@
           if (g.playerId) {
             var lsEntry = State.lobbyStatus.get(g.playerId);
             if (lsEntry && lsEntry.status) {
-              var lsAge    = now - lsEntry.ts;
-              var lsAgeStr = esc(formatAge(lsEntry.ts, now)) + '&nbsp;ago';
+              var lsDataTs  = lsEntry.apiTs || lsEntry.ts;
+              var lsAge     = now - lsDataTs;
+              /* "rcpt" prefix when age is from request receipt time (apiTs unavailable) */
+              var lsAgeStr  = lsEntry.apiTs
+                ? esc(formatAge(lsDataTs, now)) + '&nbsp;ago'
+                : 'rcpt\u00a0' + esc(formatAge(lsDataTs, now)) + '&nbsp;ago';
               if (lsEntry.status === 'Hospital') {
                 lbHosp = true;
-                htmlG += '<div class="gs ho">\uD83C\uDFE5 Hospital (' + lsAgeStr + ')</div>';
+                htmlG += '<div class="gs ho">\uD83C\uDFE5 Hospital\u00a0\u00b7\u00a0' + lsAgeStr + '</div>';
               } else if (lsAge > STATUS_STALE_MS) {
-                htmlG += '<div class="gs stale">Stale \u2014 last: ' + esc(lsEntry.status) + ' (' + lsAgeStr + ')</div>';
+                htmlG += '<div class="gs stale">Stale\u00a0\u00b7\u00a0last:\u00a0' + esc(lsEntry.status) + '\u00a0' + lsAgeStr + '</div>';
               } else {
-                htmlG += '<div class="gs ok">Okay (' + lsAgeStr + ')</div>';
+                /* Okay receives green "ok" styling; all other states (Jail, Traveling, etc.) get neutral "neu" */
+                var lsStatusCls = lsEntry.status === 'Okay' ? 'ok' : 'neu';
+                htmlG += '<div class="gs ' + lsStatusCls + '">API\u202F' + esc(lsEntry.status) + '\u00a0\u00b7\u00a0' + lsAgeStr + '</div>';
               }
             } else if (StatusChecker.canCheck()) {
               if (StatusChecker.checkingPlayerId() === g.playerId) {
@@ -2631,14 +2808,22 @@
         if (!State.statusEnabled) {
           s += 'Status: checks disabled';
         } else if (dc.latestStatus) {
-          var stAge    = now - (dc.latestStatusTs || 0);
-          var stAgeStr = dc.latestStatusTs ? ('&nbsp;(' + esc(formatAge(dc.latestStatusTs, now)) + '&nbsp;ago)') : '';
-          var isStale  = stAge > STATUS_STALE_MS && dc.latestStatus !== 'Hospital';
+          var stDataTs  = dc.latestApiTs || dc.latestStatusTs;
+          var stAge     = now - (stDataTs || 0);
+          /* "rcpt" prefix when age is from request receipt time (latestApiTs unavailable) */
+          var stAgeStr  = stDataTs
+            ? (dc.latestApiTs
+               ? '\u00a0\u00b7\u00a0' + esc(formatAge(stDataTs, now)) + '\u00a0ago'
+               : '\u00a0\u00b7\u00a0rcpt\u00a0' + esc(formatAge(stDataTs, now)) + '\u00a0ago')
+            : '';
+          var isStale   = stAge > STATUS_STALE_MS && dc.latestStatus !== 'Hospital';
           var dwStatusLabel = (dc.latestStatus === 'Hospital' && dc.hospitalLabel) ? dc.hospitalLabel : dc.latestStatus;
           if (isStale) {
-            s += 'Status:&nbsp;<strong class="dw-stale">Stale</strong>&nbsp;\u2014 last:&nbsp;' + esc(dwStatusLabel) + stAgeStr;
+            s += 'Status:\u00a0<strong class="dw-stale">Stale</strong>\u00a0\u2014\u00a0last:\u00a0' + esc(dwStatusLabel) + stAgeStr;
+          } else if (dc.latestStatus !== 'Hospital') {
+            s += 'Status:\u00a0<strong>API\u202F' + esc(dc.latestStatus) + '</strong>' + stAgeStr;
           } else {
-            s += 'Status:&nbsp;<strong>' + esc(dwStatusLabel) + '</strong>' + stAgeStr;
+            s += 'Status:\u00a0<strong>' + esc(dwStatusLabel) + '</strong>' + stAgeStr;
           }
         } else if (StatusChecker.checkingPlayerId() === dc.playerId) {
           s += 'Status:&nbsp;<em>Checking\u2026</em>';
@@ -2697,9 +2882,11 @@
         if (!dwActive.length) {
           htmlW += '<div class="dw-empty">All watched disappearances are currently hospitalised.</div>';
         } else {
+          htmlW += '<div class="dw-list">';
           for (var di = 0; di < dwActive.length; di++) {
             htmlW += _renderDwCard(dwActive[di], false);
           }
+          htmlW += '</div>';
         }
         if (dwHosp.length) {
           htmlW += '<div class="dw-hosp-wrap">';
@@ -2718,8 +2905,16 @@
       htmlW += '</div>';  /* /dws — DW cards section; no inputs, always safe to replace */
 
       if (!_inputFocused($w)) {
+        var _dwListEl    = $w.querySelector('.dw-list');
+        var _dwScrollTop = _dwListEl ? _dwListEl.scrollTop : 0;
         $w.innerHTML = htmlW;
         _wireDw();
+        if (_dwScrollTop > 0) {
+          var _dwListNew = $w.querySelector('.dw-list');
+          if (_dwListNew) {
+            _dwListNew.scrollTop = Math.min(_dwScrollTop, Math.max(0, _dwListNew.scrollHeight - _dwListNew.clientHeight));
+          }
+        }
       }
 
       /* === Section C: dw-cfg + cfg + History & Diagnostics (skipped if any input focused) === */
@@ -2739,14 +2934,32 @@
               '<input id="rrmt-dw-mb" type="text" size="6" value="' +
               esc(State.dwMbDraft !== null ? State.dwMbDraft : fmtBet(State.dwWatchMin)) +
               '" placeholder="e.g.\u202F50M"></label>';
-      if (State.dwMbDraft !== null && parseMinBet(State.dwMbDraft) === null) {
-        htmlC += '<span class="inp-err">Invalid</span>';
-      }
+      (function() {
+        var _dwv = State.dwMbDraft !== null ? parseMinBet(State.dwMbDraft) : State.dwWatchMin;
+        if (State.dwMbDraft !== null && parseMinBet(State.dwMbDraft) === null) {
+          htmlC += '<span id="rrmt-dw-mb-hint" class="inp-err">Invalid</span>';
+        } else if (_dwv !== null && _dwv < SMALL_BET_WARN) {
+          htmlC += '<span id="rrmt-dw-mb-hint" class="inp-hint warn-small">' + esc(fmtFull(_dwv)) + '\u00a0\u26a0</span>';
+        } else if (_dwv !== null) {
+          htmlC += '<span id="rrmt-dw-mb-hint" class="inp-hint">' + esc(fmtFull(_dwv)) + '</span>';
+        } else {
+          htmlC += '<span id="rrmt-dw-mb-hint" class="inp-hint"></span>';
+        }
+      }());
       htmlC += '</div>';
       htmlC += '<div class="cfg"><label title="Hides games below this amount from the main list">Min Bet (lobby):&nbsp;<input id="rrmt-mb" type="text" value="' + esc(State.mbDraft !== null ? State.mbDraft : fmtBet(State.minBet)) + '" placeholder="e.g. 200M"></label>';
-      if (State.mbDraft !== null && parseMinBet(State.mbDraft) === null) {
-        htmlC += '<span class="inp-err">Invalid</span>';
-      }
+      (function() {
+        var _mbv = State.mbDraft !== null ? parseMinBet(State.mbDraft) : State.minBet;
+        if (State.mbDraft !== null && parseMinBet(State.mbDraft) === null) {
+          htmlC += '<span id="rrmt-mb-hint" class="inp-err">Invalid</span>';
+        } else if (_mbv !== null && _mbv < SMALL_BET_WARN) {
+          htmlC += '<span id="rrmt-mb-hint" class="inp-hint warn-small">' + esc(fmtFull(_mbv)) + '\u00a0\u26a0</span>';
+        } else if (_mbv !== null) {
+          htmlC += '<span id="rrmt-mb-hint" class="inp-hint">' + esc(fmtFull(_mbv)) + '</span>';
+        } else {
+          htmlC += '<span id="rrmt-mb-hint" class="inp-hint"></span>';
+        }
+      }());
       htmlC += '</div>';
 
       htmlC += '<div class="dh-wrap">';
@@ -2902,17 +3115,34 @@
         }
         var scOnEl = shadow.getElementById('rrmt-sc-on');
         if (scOnEl) scOnEl.addEventListener('change', function() {
+          if (!this.checked) StatusChecker.cancelPending();
           State.statusEnabled = this.checked;
           PersistenceStore.savePref(STATUS_PREF_KEY, this.checked);
           render();
         });
         var scKeyEl = shadow.getElementById('rrmt-sc-key');
         if (scKeyEl) scKeyEl.addEventListener('change', function() {
+          if (State.apiKey !== this.value.trim()) StatusChecker.cancelPending();
           State.apiKey = this.value.trim();
         });
         var dwMbEl = shadow.getElementById('rrmt-dw-mb');
         if (dwMbEl) {
-          dwMbEl.addEventListener('input', function() { State.dwMbDraft = this.value; });
+          dwMbEl.addEventListener('input', function() {
+            State.dwMbDraft = this.value;
+            var _hint = shadow.getElementById('rrmt-dw-mb-hint');
+            if (_hint) {
+              var _v = parseMinBet(this.value);
+              if (this.value && _v === null) {
+                _hint.className = 'inp-err'; _hint.textContent = 'Invalid';
+              } else if (_v !== null && _v < SMALL_BET_WARN) {
+                _hint.className = 'inp-hint warn-small'; _hint.textContent = fmtFull(_v) + '\u00a0\u26a0';
+              } else if (_v !== null) {
+                _hint.className = 'inp-hint'; _hint.textContent = fmtFull(_v);
+              } else {
+                _hint.className = 'inp-hint'; _hint.textContent = '';
+              }
+            }
+          });
           dwMbEl.addEventListener('change', function() {
             var v = parseMinBet(this.value);
             if (v !== null) {
@@ -2934,7 +3164,22 @@
         }
         var mbEl = shadow.getElementById('rrmt-mb');
         if (mbEl) {
-          mbEl.addEventListener('input', function() { State.mbDraft = this.value; });
+          mbEl.addEventListener('input', function() {
+            State.mbDraft = this.value;
+            var _hint = shadow.getElementById('rrmt-mb-hint');
+            if (_hint) {
+              var _v = parseMinBet(this.value);
+              if (this.value && _v === null) {
+                _hint.className = 'inp-err'; _hint.textContent = 'Invalid';
+              } else if (_v !== null && _v < SMALL_BET_WARN) {
+                _hint.className = 'inp-hint warn-small'; _hint.textContent = fmtFull(_v) + '\u00a0\u26a0';
+              } else if (_v !== null) {
+                _hint.className = 'inp-hint'; _hint.textContent = fmtFull(_v);
+              } else {
+                _hint.className = 'inp-hint'; _hint.textContent = '';
+              }
+            }
+          });
           mbEl.addEventListener('change', function() {
             var v = parseMinBet(this.value);
             if (v && v > 0) {
@@ -3108,6 +3353,9 @@
       host.style.cssText = 'all:initial;display:block;position:static';
       shadow = typeof host.attachShadow === 'function'
         ? host.attachShadow({ mode: 'open' }) : host;
+      /* Track focused input via events — reliable across browsers where shadow.activeElement lags */
+      shadow.addEventListener('focusin',  function(e) { _shadowActiveFallback = e.target; });
+      shadow.addEventListener('focusout', function()  { _shadowActiveFallback = null; });
       const style = document.createElement('style');
       style.textContent = CSS;
       shadow.appendChild(style);
@@ -3195,9 +3443,10 @@
         UI_LABEL,
         DisappearanceEngine, StatusChecker,
         PersistenceStore,
-        DE_HISTORY_MAX, DE_STORE_VERSION,
+        DE_HISTORY_MAX, DE_STORE_VERSION, DE_RATE_MS, DE_RETRY_DELAY_MS,
         DW_PREF_KEY, DEFAULT_DW_MIN_BET, DEFAULT_MIN_BET, STATUS_PREF_KEY, MIN_BET_PREF_KEY,
-        LOBBY_FRESH_MS, STATUS_STALE_MS,
+        LOBBY_FRESH_MS, STATUS_STALE_MS, SMALL_BET_WARN,
+        fmtFull,
         exportHistoryJSON, exportHistoryCSV, importHistoryJSON,
       };
     }
